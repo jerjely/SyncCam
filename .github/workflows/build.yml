@@ -1,0 +1,282 @@
+name: Build installers
+
+# Push a tag like v1.0.0  -> build, test and publish a release.
+# Actions > Run workflow   -> version box filled: build, test, create the release and tag itself.
+#                          -> version box empty:  build and test only (installers kept as artifacts).
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. 1.0.0 (leave empty to only build and test)"
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  group: build-installers-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------- version
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      numeric: ${{ steps.v.outputs.numeric }}
+      tag: ${{ steps.v.outputs.tag }}
+      release: ${{ steps.v.outputs.release }}
+    steps:
+      - id: v
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release=true
+          if [ "$EVENT" = "push" ]; then
+            version="${REF_NAME#v}"
+          else
+            version="${INPUT_VERSION//[[:space:]]/}"
+            version="${version#v}"
+            if [ -z "$version" ]; then
+              release=false
+              version="0.0.0-test"
+            fi
+          fi
+          if ! echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.+-][0-9A-Za-z.+-]+)?$'; then
+            echo "::error::'$version' is not a version like 1.0.0 or 1.0.0-rc1 (tag names must look like v1.0.0)"
+            exit 1
+          fi
+          numeric="$(echo "$version" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+').0"
+          tag="v$version"
+          if [ "$release" = "true" ] && [ "$EVENT" != "push" ]; then
+            if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "::error::A release $tag already exists. Pick a new version number."
+              exit 1
+            fi
+          fi
+          {
+            echo "version=$version"
+            echo "numeric=$numeric"
+            echo "tag=$tag"
+            echo "release=$release"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### SyncCam $version"
+            if [ "$release" = "true" ]; then
+              echo "A release **$tag** will be published if all three builds pass."
+            else
+              echo "Test build only: no release will be created."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------------------ build
+  build:
+    needs: prepare
+    name: Build (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: Windows
+            arch: ""
+          - os: macos-15
+            label: macOS-AppleSilicon
+            arch: AppleSilicon
+          - os: macos-15-intel
+            label: macOS-Intel
+            arch: Intel
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      NUMERIC: ${{ needs.prepare.outputs.numeric }}
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+          python -c "import platform, cv2; print('python', platform.python_version(), platform.machine(), 'opencv', cv2.__version__)"
+
+      - name: Stamp the version from the tag
+        shell: bash
+        run: python packaging/set_version.py "$VERSION"
+
+      - name: Build the app with PyInstaller
+        shell: bash
+        run: python -m PyInstaller --noconfirm --clean SyncCam.spec
+
+      # ---- the app must work before anything is packaged
+      - name: Self-test the built app (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP "selftest-built.log"
+          $p = Start-Process -FilePath "dist\SyncCam\SyncCam.exe" -Wait -PassThru `
+                 -ArgumentList @("--selftest", "--expect-version", $env:VERSION, "--selftest-log", $log)
+          if (Test-Path $log) { Get-Content $log }
+          if ($p.ExitCode -ne 0) { throw "Self-test of the built app failed (exit code $($p.ExitCode))" }
+
+      - name: Self-test the built app (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          lipo -archs dist/SyncCam.app/Contents/MacOS/SyncCam || true
+          /usr/libexec/PlistBuddy -c "Print :NSCameraUsageDescription" dist/SyncCam.app/Contents/Info.plist
+          LOG="$RUNNER_TEMP/selftest-built.log"
+          rc=0
+          dist/SyncCam.app/Contents/MacOS/SyncCam --selftest --expect-version "$VERSION" --selftest-log "$LOG" || rc=$?
+          cat "$LOG" || true
+          if [ "$rc" -ne 0 ]; then echo "::error::Self-test of the built app failed (exit code $rc)"; fi
+          exit "$rc"
+
+      # ---- package
+      - name: Build the Windows installer (Inno Setup)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $iscc = (Get-Command iscc -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) {
+            foreach ($p in @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe")) {
+              if (Test-Path $p) { $iscc = $p; break }
+            }
+          }
+          if (-not $iscc) {
+            choco install innosetup -y --no-progress
+            $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          }
+          & $iscc "/DAppVersion=$env:VERSION" "/DNumericVersion=$env:NUMERIC" "packaging\windows\SyncCam.iss"
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
+          Get-ChildItem installer_out
+
+      - name: Build the macOS installer (.pkg)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: bash packaging/macos/build_pkg.sh "$VERSION" "$ARCH"
+
+      # ---- the installer itself must work too
+      - name: Install silently and self-test the installed app (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $setup = "installer_out\SyncCam-$($env:VERSION)-Windows-setup.exe"
+          $dir = Join-Path $env:RUNNER_TEMP "SyncCam-installed"
+          $p = Start-Process -FilePath $setup -Wait -PassThru `
+                 -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$dir")
+          if ($p.ExitCode -ne 0) { throw "Installer failed (exit code $($p.ExitCode))" }
+          if (-not (Test-Path "$dir\SyncCam.exe")) { throw "SyncCam.exe was not installed" }
+          $log = Join-Path $env:RUNNER_TEMP "selftest-installed.log"
+          $t = Start-Process -FilePath "$dir\SyncCam.exe" -Wait -PassThru `
+                 -ArgumentList @("--selftest", "--expect-version", $env:VERSION, "--selftest-log", $log)
+          if (Test-Path $log) { Get-Content $log }
+          if ($t.ExitCode -ne 0) { throw "Self-test of the installed app failed (exit code $($t.ExitCode))" }
+
+      - name: Install the .pkg and self-test the installed app (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          sudo installer -pkg "installer_out/SyncCam-${VERSION}-macOS-${ARCH}.pkg" -target /
+          test -d /Applications/SyncCam.app
+          LOG="$RUNNER_TEMP/selftest-installed.log"
+          rc=0
+          /Applications/SyncCam.app/Contents/MacOS/SyncCam --selftest --expect-version "$VERSION" --selftest-log "$LOG" || rc=$?
+          cat "$LOG" || true
+          if [ "$rc" -ne 0 ]; then echo "::error::Self-test of the installed app failed (exit code $rc)"; fi
+          exit "$rc"
+
+      - name: Keep the installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-${{ matrix.label }}
+          path: installer_out/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Keep the self-test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: selftest-${{ matrix.label }}
+          path: ${{ runner.temp }}/selftest-*.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ---------------------------------------------------------------- release
+  release:
+    needs: [prepare, build]
+    if: needs.prepare.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: installer-*
+          path: release_files
+          merge-multiple: true
+
+      - name: Check that all three installers are there
+        run: |
+          set -euo pipefail
+          ls -l release_files
+          for f in "SyncCam-${VERSION}-Windows-setup.exe" \
+                   "SyncCam-${VERSION}-macOS-AppleSilicon.pkg" \
+                   "SyncCam-${VERSION}-macOS-Intel.pkg"; do
+            test -f "release_files/$f" || { echo "::error::missing $f"; exit 1; }
+          done
+
+      - name: Write the release notes
+        run: |
+          cat > notes.md <<EOF
+          SyncCam $VERSION - USB camera recording with an Arduino-sampled TTL sync signal, microphone and IR LED.
+
+          ## Download
+
+          | Your computer | File |
+          |---|---|
+          | Windows 10 / 11 | SyncCam-$VERSION-Windows-setup.exe |
+          | Mac with Apple silicon (M1 or newer) | SyncCam-$VERSION-macOS-AppleSilicon.pkg |
+          | Mac with an Intel processor | SyncCam-$VERSION-macOS-Intel.pkg |
+
+          ## Opening the unsigned installers
+
+          The installers are not code-signed, so Windows and macOS warn you the first time.
+
+          - **Windows:** in the blue "Windows protected your PC" window click **More info**, then **Run anyway**. No administrator rights are needed.
+          - **Mac:** double-click the .pkg. When macOS says it cannot be opened, go to **System Settings > Privacy & Security**, scroll down and click **Open Anyway** next to the SyncCam message, then confirm. The first time you open a camera, macOS asks for camera access: click **Allow**.
+
+          ## Before you use it
+
+          The Arduino needs the sketch from the firmware folder of this repository (upload it once with the Arduino IDE; it cannot be part of the installer). See the README for the wiring.
+          EOF
+
+      - name: Publish the release
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release_files/* --clobber
+          else
+            gh release create "$TAG" release_files/* --title "SyncCam $VERSION" \
+              --notes-file notes.md --target "$GITHUB_SHA"
+          fi
