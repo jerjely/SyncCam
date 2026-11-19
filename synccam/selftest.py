@@ -117,20 +117,22 @@ def t_edges_and_clock(ctx):
 
 
 def t_simulated_stream(ctx):
-    from .arduino import IR_FOLLOW, IR_PULSE, ArduinoStream, SimulatedArduino
+    from .arduino import IR_OFF, IR_ON, ArduinoStream, SimulatedArduino
     st = ArduinoStream(SimulatedArduino(), 5000)
-    info = st.connect(IR_FOLLOW)
+    info = st.connect(IR_OFF)
     assert info.firmware.startswith("SYNCCAM"), info.firmware
     time.sleep(1.1)
     d = st.recent(1.0)
     assert st.error is None, st.error
     assert len(d) == 5000, len(d)
     assert d[:, 0].max() > 900 and d[:, 0].min() < 50, "TTL channel missing"
-    assert 0.1 < d[:, 2].mean() < 0.35, f"LED should follow the TTL ({d[:, 2].mean():.2f})"
-    st.set_ir(IR_PULSE, (200, 50))
-    time.sleep(0.7)
-    d = st.recent(0.4)
-    assert 0.15 < d[:, 2].mean() < 0.35, f"LED pulses wrong ({d[:, 2].mean():.2f})"
+    assert d[:, 2].max() == 0, "IR LED should be off"
+    st.set_ir(IR_ON)
+    time.sleep(0.4)
+    assert st.recent(0.2)[:, 2].min() == 1, "IR LED did not switch on"
+    st.set_ir(IR_OFF)
+    time.sleep(0.4)
+    assert st.recent(0.2)[:, 2].max() == 0, "IR LED did not switch off"
     st.close()
     ctx.log(f"    {st.total} samples, {st.unwrap.dropped} lost")
 
@@ -149,15 +151,14 @@ def t_serial_commands(ctx):
 
 def t_recording(ctx):
     """Full recording: test-pattern camera + simulated Arduino, LED followed in the video."""
-    from .arduino import IR_PULSE, ArduinoStream, SimulatedArduino
-    from .camera import TEST_PATTERN, CameraThread, TestPatternSource
+    from .arduino import IR_ON, ArduinoStream, SimulatedArduino
+    from .camera import TEST_PATTERN, CameraThread
     from .session import Recording
     sim = SimulatedArduino()
     st = ArduinoStream(sim, 5000)
-    st.connect(IR_PULSE, (400, 120))
+    st.connect(IR_ON)
     cam = CameraThread(TEST_PATTERN, (320, 240), 30, sim.current_led)
     cam.open()
-    cam.roi = TestPatternSource.LED_RECT
     time.sleep(0.5)
     rec = Recording(str(ctx.tmp), "selftest", cam, st, "MJPG", 512, {"name": "selftest"})
     rec.start()
@@ -167,7 +168,7 @@ def t_recording(ctx):
     st.close()
     folder = rec.folder
     for name in ("video.avi", "frames.csv", "analog.wav", "microphone.wav", "ttl_events.csv",
-                 "led_events.csv", "session.json"):
+                 "session.json"):
         assert (folder / name).exists(), f"{name} missing"
     js = json.loads((folder / "session.json").read_text(encoding="utf-8"))
     frames = _read_csv(folder / "frames.csv")
@@ -182,7 +183,7 @@ def t_recording(ctx):
         ns = w.getnframes()
         raw = np.frombuffer(w.readframes(ns), dtype="<i2").reshape(-1, 3)
     assert abs(ns - 15000) < 900, f"{ns} samples in 3 s at 5 kHz"
-    assert raw[:, 0].max() > 900 and set(np.unique(raw[:, 2])) <= {0, 1}
+    assert raw[:, 0].max() > 900 and raw[:, 2].min() == 1, "TTL missing or IR LED not on"
     assert js["arduino"]["samples_lost_and_filled"] == 0, f"{js['arduino']['samples_lost_and_filled']} samples lost"
     ttl = [r for r in _read_csv(folder / "ttl_events.csv") if r["edge"] == "rise"]
     assert 4 <= len(ttl) <= 7, f"{len(ttl)} TTL pulses in 3 s"
@@ -194,18 +195,37 @@ def t_recording(ctx):
     true = np.array(true)
     errs = [np.min(np.abs(true - float(r["time_s"]))) for r in ttl]
     assert max(errs) < 0.006, f"TTL edge times off by up to {max(errs) * 1000:.1f} ms"
-    lag = js.get("led_video_lag", {})
-    assert lag.get("matched_onsets", 0) >= 4, f"LED not found in the video: {lag}"
-    assert -5 <= lag["median_ms"] <= 120, f"LED-to-video lag {lag['median_ms']} ms"
-    ctx.log(f"    {len(frames)} frames, {ns} samples, {len(ttl)} TTL pulses, "
-            f"LED video lag {lag['median_ms']} ms")
+    # every TTL edge names the frame at that moment, and that frame's time
+    ft = np.array([float(r["time_s"]) for r in frames])
+    for r in _read_csv(folder / "ttl_events.csv"):
+        if r["video_frame"] == "":
+            continue
+        i, t, tf = int(r["video_frame"]), float(r["time_s"]), float(r["frame_time_s"])
+        assert abs(tf - ft[i]) < 1e-5, "frame_time_s does not match frames.csv"
+        assert tf >= t and (i == 0 or ft[i - 1] < t), f"wrong frame {i} for TTL at {t:.4f} s"
+    # the sound lines up with the TTL sample by sample: the simulator plays a tone burst
+    # exactly while every third TTL pulse is high
+    mic = raw[:, 1].astype(float) - 512
+    bursts = 0
+    for r in ttl:
+        k = int(r["sample"])
+        if k < 100 or k + 600 > len(mic):
+            continue
+        before = mic[k - 100:k - 5].std()
+        after = mic[k + 5:k + 100].std()
+        if after > 3 * before:
+            bursts += 1
+            onset = k - 50 + int(np.argmax(np.abs(mic[k - 50:k + 50]) > 150))
+            assert abs(onset - k) <= 3, f"sound onset {onset} vs TTL sample {k}"
+    assert bursts >= 1, "no tone burst found at a TTL pulse"
+    ctx.log(f"    {len(frames)} frames, {ns} samples, {len(ttl)} TTL pulses, {bursts} tone burst(s) aligned")
 
 
 def t_gui(ctx):
     from PySide6.QtCore import QSettings
     from PySide6.QtWidgets import QApplication
-    from .arduino import IR_FOLLOW, SIM_PORT
-    from .camera import TEST_PATTERN, TestPatternSource
+    from .arduino import SIM_PORT
+    from .camera import TEST_PATTERN
     from .gui import MainWindow, app_icon, apply_style
 
     app = QApplication.instance() or QApplication(["synccam-selftest"])
@@ -224,12 +244,13 @@ def t_gui(ctx):
     win.res_combo.setCurrentIndex(1)
     win.cam_btn.click()
     assert win.camera is not None, "test-pattern camera did not open"
-    win.view.set_roi(TestPatternSource.LED_RECT)
     win.port_combo.setCurrentIndex(win.port_combo.findData(SIM_PORT))
-    win.ir_combo.setCurrentIndex(win.ir_combo.findData(IR_FOLLOW))
     win.ard_btn.click()
+    win.ir_btn.click()
     assert win.stream is not None, "simulated Arduino did not connect"
     _pump(app, lambda: win.camera.latest is not None and win.stream.total > 2000, 5, "camera and Arduino data")
+    assert win.ir_btn.text() == "IR LED: ON"
+    _pump(app, lambda: win.stream.last_led, 3, "IR LED on")
     assert win.rec_btn.isEnabled()
     win.rec_btn.click()
     assert win.recording is not None
@@ -245,7 +266,7 @@ def t_gui(ctx):
     assert win.rec_status.text().startswith("Saved"), win.rec_status.text()
     js = json.loads((win.last_folder / "session.json").read_text(encoding="utf-8"))
     assert js["video"]["frames"] > 40 and js["arduino"]["samples"] > 10000, js
-    assert js["ir_led"]["mode"] == "Follow TTL"
+    assert js["ir_led_at_start"] == "on"
     win.close()
     app.processEvents()
 

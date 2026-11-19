@@ -6,11 +6,11 @@ Records video from a USB camera together with signals that an Arduino samples:
 
 - the **TTL sync signal** that also goes to the Neuropixels (OneBox / Open Ephys), on A0
 - a **microphone**, on A1
-- an **IR LED**, which the Arduino drives and which the camera sees, on D8
+- an **IR LED** that the Arduino switches on and off, on D8
 
-Every video frame, every Arduino sample and every TTL edge is saved on the same clock,
-so you can line up the video with the Neuropixels recording through the shared TTL.
-The IR LED checks that alignment in the video itself.
+Every video frame, every Arduino sample and every TTL edge is saved on the same clock.
+For each TTL pulse you get the video frame at that moment, and the sound at the same
+sample, so video, sound and the Neuropixels recording line up through the shared TTL.
 
 Windows 10/11 and macOS (Apple silicon and Intel).
 
@@ -44,31 +44,20 @@ Upload `firmware/SyncCam_Arduino/SyncCam_Arduino.ino` once with the Arduino IDE 
 | D8 | IR LED through a resistor (for example 180 Ω for a 20 mA LED), or a transistor/MOSFET for brighter LEDs |
 | GND | Common ground with the TTL source and the microphone |
 
-Put the IR LED where the camera sees it (at the edge of the picture, or pointing at the lens).
-
 The sketch samples both analog inputs at the chosen rate (1–10 kHz, default 5 kHz, 10-bit) and
 streams them at 1,000,000 baud. Each sample carries a counter, so lost samples are detected and
 reported. Commands are documented at the top of the sketch.
-
-**IR LED modes**
-
-| Mode | What the LED does |
-|---|---|
-| Off / On | Steady |
-| Follow TTL | Mirrors the TTL input, so the Neuropixels sync pulses show up in the video |
-| Pulses | Flashes with the period and width you set (timed on the Arduino) |
 
 ## Using it
 
 1. **Camera:** pick the camera (**Scan** finds connected ones), size and frame rate, then **Open camera**.
 2. **Arduino:** pick the port and **Connect**. The board restarts when the port opens, which takes about 2 s.
    Set the TTL threshold (default 2.5 V). The red dashed line in the TTL plot shows it.
-3. **IR LED:** choose a mode. Then drag a box around the LED in the camera picture. SyncCam then saves
-   the LED's brightness for every frame.
+3. **IR LED:** click the button to switch it on or off. It stays as you set it, and SyncCam remembers
+   the setting next time you connect.
 4. **Recording:** choose a folder and a name, then **Record** and **Stop recording**.
 
 **Simulator (no hardware)** and **Test pattern (no camera)** let you try everything without hardware.
-In the test pattern, the square in the top-left corner acts as the IR LED.
 
 ## What gets saved
 
@@ -77,12 +66,11 @@ Each recording goes into its own folder, `<name>_<date>_<time>/`:
 | File | Contents |
 |---|---|
 | `video.avi` (or `.mp4`) | The camera video |
-| `frames.csv` | For every frame: `time_s`, wall clock, the matching Arduino `sample`, LED-box brightness |
+| `frames.csv` | For every frame: `time_s`, wall clock, and the matching Arduino `sample` |
+| `ttl_events.csv` | Every TTL rising and falling edge: `sample`, `time_s`, `video_frame`, `frame_time_s` |
+| `microphone.wav` | The microphone, centred and amplified so you can listen to it |
 | `analog.wav` | 3 channels at the sample rate, raw values: TTL (0–1023), microphone (0–1023), IR LED (0/1) |
-| `microphone.wav` | The microphone alone, centred and amplified so you can listen to it |
-| `ttl_events.csv` | TTL rising and falling edges: sample, `time_s`, video frame |
-| `led_events.csv` | IR LED on and off edges (from the Arduino): sample, `time_s`, video frame |
-| `session.json` | Settings, measured frame rate, Arduino clock fit, drop counts, LED-to-video delay |
+| `session.json` | Settings, measured frame rate, Arduino clock fit, drop counts |
 
 All `time_s` values are seconds since **Record** was pressed, on the computer's clock.
 Arduino sample *n* happened at `first_sample_time_s + n / measured_rate_hz` (both in `session.json`).
@@ -90,16 +78,23 @@ Arduino sample *n* happened at `first_sample_time_s + n / measured_rate_hz` (bot
 **Use `frames.csv` for frame times,** not the frame rate written in the video file. USB cameras
 never run at exactly their nominal rate. The file's header uses the rate measured just before recording.
 
-### Lining up with the Neuropixels
+### How video, sound and TTL line up
 
-The TTL edges in `ttl_events.csv` are the same pulses the OneBox recorded. Match them to the
-TTL events in Open Ephys / SpikeGLX, then use the `video_frame` column, or `frames.csv`, to find
-the frame for any Neuropixels time.
+- **TTL and sound** are sampled together by the Arduino, so sample *n* of `microphone.wav`
+  is the same moment as sample *n* of the TTL. The `sample` column of `ttl_events.csv` points
+  straight into the sound file.
+- **TTL and video:** each row of `ttl_events.csv` gives the `video_frame` at the moment of that
+  edge (the first frame that reached the computer at or after it) and that frame's time.
+- **Video and sound:** `frames.csv` gives the matching Arduino sample for every frame.
 
-A frame's time is when the computer received it, which is a little after the exposure. The IR LED
-lets you measure this delay: `session.json → led_video_lag` gives the median delay between the
-Arduino turning the LED on and the first frame showing it. Subtract it from frame times when you
-need millisecond-level alignment. The spread is up to one frame interval.
+To line up with the Neuropixels, match the TTL edges in `ttl_events.csv` to the TTL events
+in Open Ephys / SpikeGLX (they are the same pulses), then read off the video frame or the
+sound sample for any Neuropixels time.
+
+Frame times are when each frame reached the computer, which is a little after its exposure
+(typically one or two frame intervals for USB cameras). If you need alignment to better than a
+frame or two, measure this delay once for your camera, for example by filming an LED that the
+TTL switches.
 
 ## Limits
 

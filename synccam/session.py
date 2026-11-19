@@ -4,12 +4,14 @@ Files written (all times in seconds from the moment Record was pressed, on the
 computer's clock; sample numbers count from the first saved Arduino sample):
 
     video.avi / video.mp4   the camera video
-    frames.csv              per video frame: time, wall clock, matching Arduino sample, LED-ROI brightness
+    frames.csv              per video frame: time, wall clock, matching Arduino sample
     analog.wav              3 channels, raw values: TTL (A0, 0-1023), microphone (A1, 0-1023), IR LED (0/1)
     microphone.wav          the microphone alone, centred and scaled so it can be listened to
-    ttl_events.csv          TTL rising/falling edges with time, sample and video frame
-    led_events.csv          IR LED on/off edges (from the Arduino) with time, sample and video frame
-    session.json            settings, clock fit, frame rate, drop counts, LED video lag
+    ttl_events.csv          TTL rising/falling edges: sample, time, and the video frame at that moment
+    session.json            settings, clock fit, frame rate, drop counts
+
+The sample number is the same in analog.wav, microphone.wav, ttl_events.csv and
+frames.csv, so sound, TTL and video line up through it.
 """
 from __future__ import annotations
 
@@ -27,7 +29,7 @@ from typing import List, Optional
 import numpy as np
 
 from . import __version__
-from .arduino import IR_MODE_NAMES, ArduinoStream, ClockFit, detect_edges
+from .arduino import ArduinoStream, ClockFit, detect_edges
 from .camera import CODECS, CameraThread, Frame, VideoWriterThread
 
 TTL_HYST = 40
@@ -57,7 +59,6 @@ class Recording:
         # video
         self.writer: Optional[VideoWriterThread] = None
         self.frame_t: List[float] = []
-        self.frame_roi: List[float] = []
         self.frames_seen = 0
         self.video_fps = 0.0
         # analog
@@ -70,11 +71,8 @@ class Recording:
         self._wav: Optional[wave.Wave_write] = None
         self._mic: Optional[wave.Wave_write] = None
         self._ttl_state = False
-        self._led_state = False
         self.ttl_rises: List[np.ndarray] = []
         self.ttl_falls: List[np.ndarray] = []
-        self.led_rises: List[np.ndarray] = []
-        self.led_falls: List[np.ndarray] = []
         self.summary: dict = {}
 
     # ---- start -------------------------------------------------------------
@@ -113,7 +111,6 @@ class Recording:
         self.frames_seen += 1
         if self.writer.put(f.image):
             self.frame_t.append(f.t)
-            self.frame_roi.append(f.roi_mean)
 
     def _on_samples(self, idx: np.ndarray, vals: np.ndarray, t: float) -> None:
         with self._lock:
@@ -148,9 +145,6 @@ class Recording:
             r, f_, self._ttl_state = detect_edges(full[:, 0], hi, lo, self._ttl_state)
             self.ttl_rises.append(r + base)
             self.ttl_falls.append(f_ + base)
-            r, f_, self._led_state = detect_edges(full[:, 2], 0.5, 0.5, self._led_state)
-            self.led_rises.append(r + base)
-            self.led_falls.append(f_ + base)
             # files
             self._wav.writeframes(full.astype("<i2").tobytes())
             mic = np.clip((full[:, 1].astype(np.int32) - 512) * 64, -32768, 32767).astype("<i2")
@@ -192,7 +186,6 @@ class Recording:
 
     def _write_files(self) -> dict:
         ft = np.array(self.frame_t, dtype=np.float64) - self.t0
-        roi = np.array(self.frame_roi, dtype=np.float64)
         info: dict = {
             "app": f"SyncCam {__version__}",
             "started": self.started_wall.isoformat(timespec="milliseconds"),
@@ -243,65 +236,35 @@ class Recording:
                 est = None
             with open(self.folder / "frames.csv", "w", newline="", encoding="utf-8") as fh:
                 w = csv.writer(fh)
-                w.writerow(["frame", "time_s", "wall_time", "arduino_sample", "led_roi_brightness"])
+                w.writerow(["frame", "time_s", "wall_time", "arduino_sample"])
                 for i in range(n):
                     w.writerow([i, f"{ft[i]:.6f}",
                                 (wall0 + timedelta(seconds=float(ft[i]))).isoformat(timespec="milliseconds"),
-                                "" if est is None else int(est[i]),
-                                "" if np.isnan(roi[i]) else f"{roi[i]:.2f}"])
-        # event files
+                                "" if est is None else int(est[i])])
+        # TTL events, each with the video frame at that moment
         if fit is not None:
-            for fname, rises, falls in (("ttl_events.csv", self.ttl_rises, self.ttl_falls),
-                                        ("led_events.csv", self.led_rises, self.led_falls)):
-                r = np.concatenate(rises) if rises else np.zeros(0, np.int64)
-                f = np.concatenate(falls) if falls else np.zeros(0, np.int64)
-                ev = sorted([(int(i), "rise") for i in r] + [(int(i), "fall") for i in f])
-                times = self._sample_time(np.array([e[0] for e in ev])) if ev else np.zeros(0)
-                with open(self.folder / fname, "w", newline="", encoding="utf-8") as fh:
-                    w = csv.writer(fh)
-                    w.writerow(["edge", "sample", "time_s", "video_frame"])
-                    for (s, kind), t in zip(ev, times):
-                        frame = int(np.searchsorted(ft, t)) if len(ft) else ""
-                        if len(ft) and frame >= len(ft):
-                            frame = ""
-                        w.writerow([kind, s, f"{t:.6f}", frame])
-            info["ttl_rising_edges"] = int(sum(len(a) for a in self.ttl_rises))
-            info["led_on_edges"] = int(sum(len(a) for a in self.led_rises))
-            lag = self._led_video_lag(ft, roi)
-            if lag is not None:
-                info["led_video_lag"] = lag
+            r = np.concatenate(self.ttl_rises) if self.ttl_rises else np.zeros(0, np.int64)
+            f = np.concatenate(self.ttl_falls) if self.ttl_falls else np.zeros(0, np.int64)
+            ev = sorted([(int(i), "rise") for i in r] + [(int(i), "fall") for i in f])
+            times = self._sample_time(np.array([e[0] for e in ev])) if ev else np.zeros(0)
+            with open(self.folder / "ttl_events.csv", "w", newline="", encoding="utf-8") as fh:
+                w = csv.writer(fh)
+                w.writerow(["edge", "sample", "time_s", "video_frame", "frame_time_s"])
+                for (smp, kind), t in zip(ev, times):
+                    frame, ftime = self.frame_at(ft, t)
+                    w.writerow([kind, smp, f"{t:.6f}", frame, "" if frame == "" else f"{ftime:.6f}"])
+            info["ttl_rising_edges"] = int(len(r))
         with open(self.folder / "session.json", "w", encoding="utf-8") as fh:
             json.dump(info, fh, indent=2)
         self.summary = info
         return info
 
-    def _led_video_lag(self, ft: np.ndarray, roi: np.ndarray) -> Optional[dict]:
-        """Delay between the Arduino switching the LED on and the frame time showing it."""
-        if len(ft) < 10 or np.all(np.isnan(roi)):
-            return None
-        rises = np.concatenate(self.led_rises) if self.led_rises else np.zeros(0)
-        if len(rises) == 0:
-            return None
-        v = np.nan_to_num(roi, nan=np.nanmin(roi))
-        lo, hi = np.percentile(v, 5), np.percentile(v, 95)
-        if hi - lo < 15:
-            return {"note": "LED not visible in the ROI (too little brightness change)."}
-        on = v > (lo + hi) / 2
-        onsets = np.flatnonzero(on[1:] & ~on[:-1]) + 1
-        if len(onsets) == 0:
-            return None
-        led_t = self._sample_time(rises)
-        lags = []
-        period = np.median(np.diff(ft)) if len(ft) > 1 else 0.033
-        for i in onsets:
-            j = np.searchsorted(led_t, ft[i]) - 1     # last Arduino onset before this frame
-            if j >= 0 and 0 <= ft[i] - led_t[j] < 1.0:
-                lags.append(ft[i] - led_t[j])
-        if not lags:
-            return None
-        lags = np.array(lags)
-        return {"matched_onsets": int(len(lags)), "median_ms": round(float(np.median(lags)) * 1000, 2),
-                "min_ms": round(float(lags.min()) * 1000, 2), "max_ms": round(float(lags.max()) * 1000, 2),
-                "frame_interval_ms": round(float(period) * 1000, 2),
-                "note": "Frame time minus Arduino LED onset. Includes exposure and USB delay; "
-                        "spread up to one frame interval is expected."}
+    @staticmethod
+    def frame_at(ft: np.ndarray, t: float):
+        """(frame index, frame time) for the moment t: the first frame that reached the computer
+        at or after t. A frame always arrives a little after its exposure, so this is the frame
+        whose exposure is closest to t. ("", None) if t is outside the video."""
+        if len(ft) == 0 or t < ft[0] or t > ft[-1]:
+            return "", None
+        i = int(np.searchsorted(ft, t, side="left"))
+        return i, float(ft[i])

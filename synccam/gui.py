@@ -18,8 +18,8 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QDoubleSpinBox, QFileDia
 
 from . import APP_AUTHOR, APP_NAME, APP_URL, __version__
 from .app import resource_path
-from .arduino import (IR_FOLLOW, IR_MODE_NAMES, IR_OFF, IR_PULSE, SAMPLE_RATES, SIM_PORT,
-                      ArduinoStream, SimulatedArduino, list_serial_ports, make_arduino)
+from .arduino import (IR_OFF, IR_ON, SAMPLE_RATES, SIM_PORT, ArduinoStream, SimulatedArduino,
+                      list_serial_ports, make_arduino)
 from .camera import CODECS, RESOLUTIONS, TEST_PATTERN, CameraThread, scan_cameras
 from .session import Recording
 
@@ -96,18 +96,14 @@ def hint(text: str) -> QLabel:
 
 # --------------------------------------------------------------------------
 class VideoView(QWidget):
-    """Live picture. Drag a rectangle to mark the IR LED."""
+    """Live camera picture."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumSize(480, 220)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self.setCursor(Qt.CursorShape.CrossCursor)
         self._img: Optional[QImage] = None
         self._arr = None
-        self.roi = None              # x, y, w, h in image pixels
-        self.on_roi = None           # callback(roi or None)
-        self._drag = None
         self.recording = False
         self.message = "No camera open"
         self.overlay = ""
@@ -130,44 +126,6 @@ class VideoView(QWidget):
         w, h = iw * s, ih * s
         return QRectF((self.width() - w) / 2, (self.height() - h) / 2, w, h)
 
-    def _to_img(self, pos) -> Optional[QPointF]:
-        r = self._target()
-        if r is None:
-            return None
-        s = r.width() / self._img.width()
-        x = min(max((pos.x() - r.left()) / s, 0), self._img.width() - 1)
-        y = min(max((pos.y() - r.top()) / s, 0), self._img.height() - 1)
-        return QPointF(x, y)
-
-    def mousePressEvent(self, e):
-        p = self._to_img(e.position())
-        if p is not None and e.button() == Qt.MouseButton.LeftButton:
-            self._drag = (p, p)
-            self.update()
-
-    def mouseMoveEvent(self, e):
-        if self._drag:
-            p = self._to_img(e.position())
-            if p is not None:
-                self._drag = (self._drag[0], p)
-                self.update()
-
-    def mouseReleaseEvent(self, e):
-        if self._drag:
-            a, b = self._drag
-            self._drag = None
-            x0, y0 = int(min(a.x(), b.x())), int(min(a.y(), b.y()))
-            w, h = int(abs(a.x() - b.x())), int(abs(a.y() - b.y()))
-            if w >= 3 and h >= 3:
-                self.set_roi((x0, y0, w, h))
-            self.update()
-
-    def set_roi(self, roi) -> None:
-        self.roi = roi
-        if self.on_roi:
-            self.on_roi(roi)
-        self.update()
-
     def paintEvent(self, _e):
         p = QPainter(self)
         p.fillRect(self.rect(), QColor("#0b1226"))
@@ -179,19 +137,6 @@ class VideoView(QWidget):
             return
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         p.drawImage(r, self._img)
-        s = r.width() / self._img.width()
-
-        def box(x, y, w, h):
-            return QRectF(r.left() + x * s, r.top() + y * s, w * s, h * s)
-
-        if self.roi:
-            p.setPen(QPen(QColor("#ffd23f"), 2))
-            p.drawRect(box(*self.roi))
-            p.drawText(box(*self.roi).adjusted(0, -18, 60, 0).topLeft() + QPointF(0, 14), "IR LED")
-        if self._drag:
-            a, b = self._drag
-            p.setPen(QPen(QColor("#ffd23f"), 1, Qt.PenStyle.DashLine))
-            p.drawRect(box(min(a.x(), b.x()), min(a.y(), b.y()), abs(a.x() - b.x()), abs(a.y() - b.y())))
         if self.recording:
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor("#e0334d"))
@@ -311,7 +256,7 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self._restore_settings()
         self.refresh_ports()
-        self._ir_mode_changed()
+        self._ir_toggled()
         self._update_enabled()
         self._timer = QTimer(self)
         self._timer.setInterval(33)
@@ -402,30 +347,13 @@ class MainWindow(QMainWindow):
         # 3 IR LED
         box = QGroupBox("3  IR LED")
         box.setFixedWidth(W)
-        form = QFormLayout(box)
-        self.ir_combo = QComboBox()
-        for m, name in IR_MODE_NAMES.items():
-            self.ir_combo.addItem(name, m)
-        self.per_spin = QSpinBox()
-        self.per_spin.setRange(2, 600000)
-        self.per_spin.setValue(1000)
-        self.per_spin.setSuffix(" ms")
-        self.width_spin = QSpinBox()
-        self.width_spin.setRange(1, 599999)
-        self.width_spin.setValue(100)
-        self.width_spin.setSuffix(" ms")
-        self.led_pill = QLabel("LED OFF")
-        self.led_pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.led_pill.setMinimumSize(110, 28)
-        row = QHBoxLayout()
-        row.addWidget(self.ir_combo, 1)
-        row.addWidget(self.led_pill)
-        form.addRow("Mode", row)
-        row = QHBoxLayout()
-        row.addWidget(self.per_spin, 1)
-        row.addWidget(QLabel("on for"))
-        row.addWidget(self.width_spin, 1)
-        form.addRow("Every", row)
+        v = QVBoxLayout(box)
+        self.ir_btn = QPushButton("IR LED: OFF")
+        self.ir_btn.setCheckable(True)
+        self.ir_btn.setMinimumHeight(36)
+        v.addWidget(self.ir_btn)
+        v.addWidget(hint("Switched by the Arduino (pin D8). It stays as you set it until you switch it "
+                         "or disconnect."))
         left.addWidget(box)
 
         # 4 recording
@@ -465,14 +393,7 @@ class MainWindow(QMainWindow):
         box = QGroupBox("Camera preview")
         v = QVBoxLayout(box)
         self.view = VideoView()
-        self.view.on_roi = self._roi_changed
         v.addWidget(self.view, 1)
-        row = QHBoxLayout()
-        self.roi_label = hint("Drag a box around the IR LED in the image to log its brightness per frame.")
-        row.addWidget(self.roi_label, 1)
-        self.roi_clear = QPushButton("Clear LED box")
-        row.addWidget(self.roi_clear)
-        v.addLayout(row)
         right.addWidget(box, 1)
 
         # signals
@@ -492,14 +413,11 @@ class MainWindow(QMainWindow):
         self.cam_btn.clicked.connect(self._toggle_camera)
         self.refresh_btn.clicked.connect(self.refresh_ports)
         self.ard_btn.clicked.connect(self._toggle_arduino)
-        self.ir_combo.currentIndexChanged.connect(self._ir_mode_changed)
-        self.per_spin.valueChanged.connect(self._ir_mode_changed)
-        self.width_spin.valueChanged.connect(self._ir_mode_changed)
+        self.ir_btn.toggled.connect(self._ir_toggled)
         self.thr_spin.valueChanged.connect(self._threshold_changed)
         self.dir_btn.clicked.connect(self._pick_dir)
         self.rec_btn.clicked.connect(self._toggle_record)
         self.open_btn.clicked.connect(self._open_folder)
-        self.roi_clear.clicked.connect(lambda: self.view.set_roi(None))
         self._set_cam_list([(i, f"Camera {i}") for i in range(3)])
 
     def _build_menu(self) -> None:
@@ -537,9 +455,8 @@ class MainWindow(QMainWindow):
         pick(self.res_combo, "resolution")
         pick(self.codec_combo, "codec")
         pick(self.rate_combo, "rate")
-        pick(self.ir_combo, "ir_mode")
-        for spin, key, cast in ((self.fps_spin, "fps", int), (self.per_spin, "pulse_period", int),
-                                (self.width_spin, "pulse_width", int), (self.thr_spin, "threshold", float)):
+        self.ir_btn.setChecked(str(s.value("ir_on", "false")).lower() == "true")
+        for spin, key, cast in ((self.fps_spin, "fps", int), (self.thr_spin, "threshold", float)):
             val = s.value(key)
             if val is not None:
                 try:
@@ -562,10 +479,8 @@ class MainWindow(QMainWindow):
         s.setValue("resolution", str(self.res_combo.currentData()))
         s.setValue("codec", self.codec_combo.currentData())
         s.setValue("rate", self.rate_combo.currentData())
-        s.setValue("ir_mode", self.ir_combo.currentData())
+        s.setValue("ir_on", self.ir_btn.isChecked())
         s.setValue("fps", self.fps_spin.value())
-        s.setValue("pulse_period", self.per_spin.value())
-        s.setValue("pulse_width", self.width_spin.value())
         s.setValue("threshold", self.thr_spin.value())
         s.setValue("folder", self.dir_edit.text())
         s.setValue("name", self.name_edit.text())
@@ -627,8 +542,6 @@ class MainWindow(QMainWindow):
             return False
         finally:
             QApplication.restoreOverrideCursor()
-        cam.roi = self._clip_roi(self.view.roi, cam.frame_size)
-        self.view.roi = cam.roi
         self.camera = cam
         self._update_enabled()
         return True
@@ -640,20 +553,6 @@ class MainWindow(QMainWindow):
         self.view.set_frame(None)
         self.view.message = "No camera open"
         self._update_enabled()
-
-    @staticmethod
-    def _clip_roi(roi, size):
-        if not roi:
-            return None
-        x, y, w, h = roi
-        W, H = size
-        if x >= W or y >= H:
-            return None
-        return (x, y, min(w, W - x), min(h, H - y))
-
-    def _roi_changed(self, roi) -> None:
-        if self.camera is not None:
-            self.camera.roi = roi
 
     # ---- arduino -----------------------------------------------------------
     def refresh_ports(self) -> None:
@@ -684,8 +583,7 @@ class MainWindow(QMainWindow):
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         QApplication.processEvents()
         try:
-            st.connect(self.ir_combo.currentData(), (self.per_spin.value(), self.width_spin.value()),
-                       self._threshold_adc())
+            st.connect(self._ir_mode(), ttl_threshold=self._threshold_adc())
         except Exception as exc:
             self.ard_status.setText("")
             QMessageBox.critical(self, "Cannot connect", f"{port}:\n\n{exc}\n\nIs another program "
@@ -704,16 +602,14 @@ class MainWindow(QMainWindow):
         self.scope.set_data(np.zeros((0, 3), dtype=np.int16), 5000)
         self._update_enabled()
 
-    def _ir_mode_changed(self, *_a) -> None:
-        mode = self.ir_combo.currentData()
-        pulses = mode == IR_PULSE
-        self.per_spin.setEnabled(pulses)
-        self.width_spin.setEnabled(pulses)
-        if self.width_spin.value() >= self.per_spin.value():
-            self.width_spin.setValue(max(1, self.per_spin.value() // 2))
+    def _ir_mode(self) -> int:
+        return IR_ON if self.ir_btn.isChecked() else IR_OFF
+
+    def _ir_toggled(self, *_a) -> None:
+        self.ir_btn.setText("IR LED: ON" if self.ir_btn.isChecked() else "IR LED: OFF")
         if self.stream is not None:
             try:
-                self.stream.set_ir(mode, (self.per_spin.value(), self.width_spin.value()))
+                self.stream.set_ir(self._ir_mode())
             except Exception as exc:
                 self._arduino_lost(str(exc))
 
@@ -765,10 +661,7 @@ class MainWindow(QMainWindow):
             if ans != QMessageBox.StandardButton.Yes:
                 return False
         extra = {"name": self.name_edit.text(),
-                 "ir_led": {"mode": IR_MODE_NAMES[self.ir_combo.currentData()],
-                            "pulse_period_ms": self.per_spin.value(),
-                            "pulse_width_ms": self.width_spin.value()},
-                 "led_roi": list(self.camera.roi) if self.camera is not None and self.camera.roi else None}
+                 "ir_led_at_start": "on" if self.ir_btn.isChecked() else "off"}
         try:
             Path(self.dir_edit.text()).mkdir(parents=True, exist_ok=True)
             rec = Recording(self.dir_edit.text(), self.name_edit.text(), self.camera, self.stream,
@@ -806,9 +699,6 @@ class MainWindow(QMainWindow):
             a = info["arduino"]
             bits.append(f"{a['samples']} samples, {info.get('ttl_rising_edges', 0)} TTL pulses"
                         + (f", {a['samples_lost_and_filled']} samples lost" if a["samples_lost_and_filled"] else ""))
-        lag = info.get("led_video_lag")
-        if lag and "median_ms" in lag:
-            bits.append(f"IR LED to video delay: {lag['median_ms']:.0f} ms (median)")
         self.rec_status.setStyleSheet("color: #1a7a3a;")
         self.rec_status.setText("\n".join(bits))
         self._update_enabled()
@@ -829,10 +719,7 @@ class MainWindow(QMainWindow):
             f = cam.latest
             if f is not None:
                 self.view.set_frame(f.image)
-                roi_txt = "" if np.isnan(f.roi_mean) else f"   LED box brightness {f.roi_mean:.0f}"
                 self.view.overlay = f"{cam.measured_fps():.1f} fps"
-                self.roi_label.setText(("LED box set." + roi_txt) if cam.roi else
-                                       "Drag a box around the IR LED in the image to log its brightness per frame.")
             w, h = cam.frame_size
             self.cam_status.setText(f'<span style="color:#1a9a4a">&#9679;</span> {cam.name}, {w} x {h}, '
                                     f"{cam.measured_fps():.1f} fps")
@@ -851,11 +738,9 @@ class MainWindow(QMainWindow):
                 mic = data[-st.fs // 5:, 1].astype(float)
                 self.sig_label.setText(f"TTL now {ttl_v:.2f} V ({'high' if st.last_ttl else 'low'})   |   "
                                        f"microphone level {mic.std():.0f} ADC units (rms)")
-        on = bool(st.last_led) if st is not None else False
-        self.led_pill.setText("LED ON" if on else ("LED OFF" if st is not None else "LED  -"))
-        self.led_pill.setStyleSheet(
-            ("background: #d98a00; color: #ffffff;" if on else "background: #e6e9f3; color: #5a6482;")
-            + "border-radius: 8px; font-size: 14px; font-weight: bold; letter-spacing: 1px;")
+        on = self.ir_btn.isChecked()
+        self.ir_btn.setStyleSheet(("background: #d98a00; border-color: #d98a00; color: #ffffff;" if on else "")
+                                  + "font-weight: bold;")
         rec = self.recording
         if rec is not None:
             s = rec.status()

@@ -15,8 +15,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtCore import QSettings  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from synccam.arduino import IR_FOLLOW, SIM_PORT  # noqa: E402
-from synccam.camera import TEST_PATTERN, TestPatternSource  # noqa: E402
+from synccam.arduino import SIM_PORT  # noqa: E402
+from synccam.camera import TEST_PATTERN  # noqa: E402
 from synccam.gui import MainWindow, apply_style  # noqa: E402
 
 OUT = ROOT / "docs" / "screenshots"
@@ -45,10 +45,9 @@ def main():
     win.cam_combo.setCurrentIndex(win.cam_combo.findData(TEST_PATTERN))
     win.res_combo.setCurrentIndex(1)
     win.cam_btn.click()
-    win.view.set_roi(TestPatternSource.LED_RECT)
     win.port_combo.setCurrentIndex(win.port_combo.findData(SIM_PORT))
-    win.ir_combo.setCurrentIndex(win.ir_combo.findData(IR_FOLLOW))
     win.ard_btn.click()
+    win.ir_btn.click()
     wait(app, 5.5)
     win.grab().save(str(OUT / "2_live.png"))
 
