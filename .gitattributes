@@ -1,2 +1,8 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Keep the Arduino sketch and firmware byte-identical on every OS (Windows checkouts
+# would otherwise convert them to CRLF line endings).
+*.ino text eol=lf
+*.hex text eol=lf
+SOURCE_SHA256.txt text eol=lf
+*.sh text eol=lf
+*.command text eol=lf
+*.bat text eol=crlf

@@ -387,6 +387,44 @@ TESTS = [
 ]
 
 
+class DialogDuringTest(AssertionError):
+    pass
+
+
+def _no_dialogs() -> None:
+    """A message box nobody can click would hang the test: make every one fail it instead."""
+    from PySide6.QtWidgets import QMessageBox
+
+    def refuse(kind):
+        def f(*args, **kwargs):
+            texts = [a for a in args if isinstance(a, str)]
+            raise DialogDuringTest(f"the app tried to show a {kind} dialog: " + " | ".join(texts))
+        return staticmethod(f)
+
+    for kind in ("information", "warning", "critical", "question"):
+        setattr(QMessageBox, kind, refuse(kind))
+    QMessageBox.exec = lambda self, *a: (_ for _ in ()).throw(
+        DialogDuringTest(f"the app tried to show a dialog: {self.text()}"))
+
+
+def _watchdog(seconds: float, fh) -> None:
+    """If the self-test is stuck, write where it is stuck and stop with exit code 3."""
+    import threading
+
+    def fire():
+        try:
+            fh.write(f"SELFTEST TIMEOUT after {seconds:.0f} s - stuck here:\n")
+            faulthandler.dump_traceback(file=fh, all_threads=True)
+            fh.write("SELFTEST FAILED (timeout)\n")
+            fh.flush()
+        finally:
+            os._exit(3)
+
+    t = threading.Timer(seconds, fire)
+    t.daemon = True
+    t.start()
+
+
 def run_selftest(log_path=None, expect_version=None) -> int:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     path = Path(log_path) if log_path else Path(tempfile.gettempdir()) / "synccam-selftest.log"
@@ -402,6 +440,11 @@ def run_selftest(log_path=None, expect_version=None) -> int:
             except Exception:
                 pass
 
+    _watchdog(300, fh)
+    try:
+        _no_dialogs()
+    except Exception as exc:                 # Qt missing: the imports test reports it
+        log(f"    (could not guard dialogs: {exc})")
     from . import __version__
     log(f"SyncCam {__version__} self-test  (python {sys.version.split()[0]}, {sys.platform})")
     failures = 0

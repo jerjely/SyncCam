@@ -74,7 +74,7 @@ def main() -> int:
         OUT.parent.mkdir(parents=True, exist_ok=True)
         run(["avr-objcopy", "-O", "ihex", "-R", ".eeprom", str(elf), str(OUT)])
         shutil.copy(elf, ROOT / "synccam" / "firmware" / ".last_build.elf") if "--keep-elf" in sys.argv else None
-    digest = hashlib.sha256(SKETCH.read_bytes()).hexdigest()[:16]
+    digest = hashlib.sha256(SKETCH.read_bytes().replace(b"\r\n", b"\n")).hexdigest()[:16]   # line-ending independent
     (OUT.parent / "SOURCE_SHA256.txt").write_text(f"{digest}  SyncCam_Arduino.ino\n", encoding="utf-8")
     print(f"wrote {OUT.relative_to(ROOT)}  ({text} bytes of flash), sketch sha256 {digest}")
     return 0

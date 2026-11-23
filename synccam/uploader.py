@@ -48,7 +48,13 @@ def firmware_matches_sketch() -> bool:
     """True if the bundled .hex was built from the bundled .ino (see tools/build_firmware.py)."""
     import hashlib
     want = firmware_path("SOURCE_SHA256.txt").read_text(encoding="utf-8").split()[0]
-    return hashlib.sha256(firmware_path(INO_NAME).read_bytes()).hexdigest()[:16] == want
+    return sketch_digest(firmware_path(INO_NAME).read_bytes()) == want
+
+
+def sketch_digest(data: bytes) -> str:
+    """Checksum of the sketch text, the same whatever line endings git gave the file."""
+    import hashlib
+    return hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest()[:16]
 
 
 def parse_ihex(text: str) -> bytes:

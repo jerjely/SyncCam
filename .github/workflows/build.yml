@@ -124,6 +124,7 @@ jobs:
 
       # ---- the app must work before anything is packaged
       - name: Self-test the built app (Windows)
+        timeout-minutes: 10
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -134,6 +135,7 @@ jobs:
           if ($p.ExitCode -ne 0) { throw "Self-test of the built app failed (exit code $($p.ExitCode))" }
 
       - name: Self-test the built app (macOS)
+        timeout-minutes: 10
         if: runner.os == 'macOS'
         shell: bash
         run: |
@@ -172,6 +174,7 @@ jobs:
 
       # ---- the installer itself must work too
       - name: Install silently and self-test the installed app (Windows)
+        timeout-minutes: 10
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
@@ -188,6 +191,7 @@ jobs:
           if ($t.ExitCode -ne 0) { throw "Self-test of the installed app failed (exit code $($t.ExitCode))" }
 
       - name: Install the .pkg and self-test the installed app (macOS)
+        timeout-minutes: 10
         if: runner.os == 'macOS'
         shell: bash
         run: |
