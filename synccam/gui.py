@@ -14,8 +14,8 @@ from PySide6.QtGui import (QAction, QColor, QDesktopServices, QIcon, QImage, QKe
                            QPainter, QPalette, QPen, QPixmap, QPolygonF)
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
                                QFormLayout, QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-                               QMainWindow, QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSlider,
-                               QSpinBox, QVBoxLayout, QWidget)
+                               QMainWindow, QMessageBox, QProgressDialog, QPushButton, QScrollArea,
+                               QSizePolicy, QSlider, QSpinBox, QVBoxLayout, QWidget)
 
 from . import APP_AUTHOR, APP_NAME, APP_URL, __version__
 from .app import resource_path
@@ -427,7 +427,13 @@ class MainWindow(QMainWindow):
         form.addRow("Pins", row)
         self.ard_btn = QPushButton("Connect")
         self.ard_btn.setObjectName("primary")
-        form.addRow(self.ard_btn)
+        self.flash_btn = QPushButton("Upload sketch")
+        self.flash_btn.setToolTip("Put the SyncCam sketch on an Arduino Uno or Nano (replaces e.g. Firmata). "
+                                  "No Arduino IDE needed.")
+        row = QHBoxLayout()
+        row.addWidget(self.ard_btn, 1)
+        row.addWidget(self.flash_btn)
+        form.addRow(row)
         self.ard_status = QLabel()
         self.ard_status.setWordWrap(True)
         form.addRow(self.ard_status)
@@ -558,6 +564,7 @@ class MainWindow(QMainWindow):
         self.cam_btn.clicked.connect(self._toggle_camera)
         self.refresh_btn.clicked.connect(self.refresh_ports)
         self.ard_btn.clicked.connect(self._toggle_arduino)
+        self.flash_btn.clicked.connect(self.upload_sketch)
         self.ir_btn.toggled.connect(self._ir_toggled)
         for combo in (self.ttl_pin, self.mic_pin, self.ir_pin):
             combo.currentIndexChanged.connect(self._pins_changed)
@@ -587,6 +594,13 @@ class MainWindow(QMainWindow):
         q.setShortcut(QKeySequence.StandardKey.Quit)
         q.triggered.connect(self.close)
         m.addAction(q)
+        am = self.menuBar().addMenu("&Arduino")
+        a = QAction("Upload SyncCam sketch to board (Uno / Nano)...", self)
+        a.triggered.connect(self.upload_sketch)
+        am.addAction(a)
+        a = QAction("Save sketch (.ino) for the Arduino IDE...", self)
+        a.triggered.connect(self._save_sketch)
+        am.addAction(a)
         h = self.menuBar().addMenu("&Help")
         a = QAction(f"About {APP_NAME}", self)
         a.setMenuRole(QAction.MenuRole.AboutRole)
@@ -847,6 +861,86 @@ class MainWindow(QMainWindow):
         self.scope.set_pins(ttl, mic)
         self._ir_toggled()
 
+    # ---- putting the sketch on the board --------------------------------------
+    def upload_sketch(self, ask: bool = True) -> bool:
+        import threading
+        from .uploader import UploadError, firmware_matches_sketch, upload
+        port = self.port_combo.currentData()
+        if self.stream is not None:
+            QMessageBox.information(self, "Upload sketch", "Disconnect from the Arduino first.")
+            return False
+        if not port or port == SIM_PORT:
+            QMessageBox.information(self, "Upload sketch", "Choose the Arduino's port first "
+                                    "(plug it in and click Refresh if it is not listed).")
+            return False
+        if ask:
+            ans = QMessageBox.question(
+                self, "Upload sketch",
+                f"Put the SyncCam sketch on the Arduino at {port}?\n\n"
+                "This replaces what is on the board now (for example Firmata for Bonsai). "
+                "Works with the Arduino Uno and Nano. Close Bonsai, the Arduino IDE and any "
+                "other program using this port first.")
+            if ans != QMessageBox.StandardButton.Yes:
+                return False
+        if not firmware_matches_sketch():
+            QMessageBox.warning(self, "Upload sketch", "The built-in firmware does not match the built-in "
+                                "sketch. Please report this; meanwhile use the .ino with the Arduino IDE.")
+            return False
+        dlg = QProgressDialog("Resetting the board...", None, 0, 1000, self)
+        dlg.setWindowTitle("Upload sketch")
+        dlg.setMinimumDuration(0)
+        dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        dlg.setValue(0)
+        state = {"frac": 0.0, "msg": "", "result": None, "error": None}
+
+        def work():
+            try:
+                state["result"] = upload(port, progress=lambda f, m: state.update(frac=f, msg=m))
+            except UploadError as exc:
+                state["error"] = str(exc)
+            except Exception as exc:                    # serial port busy, unplugged, ...
+                state["error"] = f"{type(exc).__name__}: {exc}"
+
+        th = threading.Thread(target=work, name="synccam-upload", daemon=True)
+        th.start()
+        while th.is_alive():
+            dlg.setValue(int(state["frac"] * 1000))
+            if state["msg"]:
+                dlg.setLabelText(state["msg"])
+            QApplication.processEvents()
+            time.sleep(0.02)
+        dlg.close()
+        if state["error"]:
+            QMessageBox.critical(self, "Upload failed", state["error"])
+            return False
+        r = state["result"]
+        self.ard_status.setText(f'<span style="color:#1a9a4a">&#9679;</span> Sketch uploaded '
+                                f'({r["bytes"]} bytes, {r["chip"]}, checked).')
+        if ask:
+            ans = QMessageBox.question(self, "Upload sketch", "The SyncCam sketch is on the board and was "
+                                       "checked. Connect now?")
+            if ans == QMessageBox.StandardButton.Yes:
+                time.sleep(0.5)
+                self.connect_arduino()
+        return True
+
+    def _save_sketch(self) -> None:
+        import shutil
+        from .uploader import INO_NAME, firmware_path
+        d = QFileDialog.getExistingDirectory(self, "Save the sketch into this folder",
+                                             str(Path.home() / "Documents"))
+        if not d:
+            return
+        folder = Path(d) / "SyncCam_Arduino"           # the Arduino IDE wants folder name = sketch name
+        try:
+            folder.mkdir(exist_ok=True)
+            shutil.copy(firmware_path(INO_NAME), folder / INO_NAME)
+        except OSError as exc:
+            QMessageBox.critical(self, "Cannot save", str(exc))
+            return
+        QMessageBox.information(self, "Sketch saved", f"Saved {folder / INO_NAME}.\n\nOpen it in the Arduino "
+                                "IDE, choose your board and port, and click Upload.")
+
     def _ir_mode(self) -> int:
         return IR_ON if self.ir_btn.isChecked() else IR_OFF
 
@@ -1022,6 +1116,7 @@ class MainWindow(QMainWindow):
             w.setEnabled(not ard)
         self.ard_btn.setText("Disconnect" if ard else "Connect")
         self.ard_btn.setEnabled(not rec)
+        self.flash_btn.setEnabled(not ard and not rec)
         if not ard:
             self.ard_status.setText('<span style="color:#8a93ad">&#9679;</span> Not connected')
             self.sig_label.setText("")

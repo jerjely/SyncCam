@@ -28,6 +28,10 @@ a = Analysis(
     datas=[
         (str(ROOT / "assets" / "icon_512.png"), "assets"),
         (str(ROOT / "assets" / "icon_256.png"), "assets"),
+        # Arduino sketch, its compiled firmware (for Arduino > Upload sketch) and the source checksum
+        (str(ROOT / "synccam" / "firmware" / "SyncCam_Arduino_328p.hex"), "synccam/firmware"),
+        (str(ROOT / "synccam" / "firmware" / "SOURCE_SHA256.txt"), "synccam/firmware"),
+        (str(ROOT / "firmware" / "SyncCam_Arduino" / "SyncCam_Arduino.ino"), "synccam/firmware"),
     ],
     # pySerial loads its URL handlers by name at run time, so list the one the self-test uses
     hiddenimports=["serial.urlhandler.protocol_loop", "serial.tools.list_ports"],

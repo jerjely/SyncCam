@@ -230,6 +230,8 @@ jobs:
       VERSION: ${{ needs.prepare.outputs.version }}
       TAG: ${{ needs.prepare.outputs.tag }}
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           pattern: installer-*
@@ -246,6 +248,12 @@ jobs:
             test -f "release_files/$f" || { echo "::error::missing $f"; exit 1; }
           done
 
+      - name: Add the Arduino sketch (for the Arduino IDE)
+        run: |
+          set -euo pipefail
+          (cd firmware && zip -r "../release_files/SyncCam-${VERSION}-Arduino-sketch.zip" SyncCam_Arduino)
+          unzip -l "release_files/SyncCam-${VERSION}-Arduino-sketch.zip"
+
       - name: Write the release notes
         run: |
           cat > notes.md <<EOF
@@ -258,6 +266,7 @@ jobs:
           | Windows 10 / 11 | SyncCam-$VERSION-Windows-setup.exe |
           | Mac with Apple silicon (M1 or newer) | SyncCam-$VERSION-macOS-AppleSilicon.pkg |
           | Mac with an Intel processor | SyncCam-$VERSION-macOS-Intel.pkg |
+          | Arduino sketch, for the Arduino IDE | SyncCam-$VERSION-Arduino-sketch.zip |
 
           ## Opening the unsigned installers
 
@@ -268,7 +277,7 @@ jobs:
 
           ## Before you use it
 
-          The Arduino needs the sketch from the firmware folder of this repository (upload it once with the Arduino IDE; it cannot be part of the installer). See the README for the wiring.
+          The Arduino needs the SyncCam sketch. With an Uno or Nano, SyncCam puts it on the board for you: choose the port and click **Upload sketch** (or Arduino > Upload sketch to board). For other boards, unzip SyncCam-$VERSION-Arduino-sketch.zip and upload it with the Arduino IDE. See the README for the wiring.
           EOF
 
       - name: Publish the release

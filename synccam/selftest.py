@@ -109,6 +109,24 @@ def t_image(ctx):
     assert stretched.min() <= 10 and stretched.max() >= 245, (b, c, stretched.min(), stretched.max())
 
 
+def t_firmware(ctx):
+    """The bundled Arduino firmware is there, matches the sketch, and uploads through STK500."""
+    from .uploader import (APP_LIMIT, INO_NAME, FakeBootloader, firmware_matches_sketch, firmware_path,
+                           parse_ihex, upload_image)
+    hexf, ino = firmware_path(), firmware_path(INO_NAME)
+    assert hexf.exists(), f"firmware missing from the app: {hexf}"
+    assert ino.exists(), f"Arduino sketch missing from the app: {ino}"
+    assert firmware_matches_sketch(), "the bundled firmware was not built from the bundled sketch " \
+                                      "(run tools/build_firmware.py)"
+    img = parse_ihex(hexf.read_text(encoding="ascii"))
+    assert 1000 < len(img) <= APP_LIMIT and b"SYNCCAM " in img, len(img)
+    for baud in (115200, 57600):                 # Uno / new Nano, then old-bootloader Nano
+        fb = FakeBootloader(baud_ok=baud)
+        r = upload_image(fb.factory, img)
+        assert r["baud"] == baud and bytes(fb.flash[:len(img)]) == img and fb.left_progmode, r
+    ctx.log(f"    firmware {len(img)} bytes, uploads at 115200 and 57600 baud")
+
+
 def t_packets(ctx):
     from .arduino import PacketParser, SeqUnwrapper, encode_packet
     pk = b"".join(encode_packet(i, (7 * i) % 1024, (13 * i) % 1024, i % 2, i % 3 == 0) for i in range(700))
@@ -280,6 +298,19 @@ def t_gui(ctx):
     win.dir_edit.setText(str(ctx.tmp / "gui_recordings"))
     win.name_edit.setText("gui test")
 
+    from . import uploader as upl
+    fb = upl.FakeBootloader()
+    real_upload = upl.upload
+    upl.upload = lambda port, hex_file=None, progress=None: upl.upload_image(
+        fb.factory, upl.parse_ihex(upl.firmware_path().read_text(encoding="ascii")), progress)
+    try:
+        win.port_combo.addItem("Test board", "test://board")
+        win.port_combo.setCurrentIndex(win.port_combo.findData("test://board"))
+        assert win.flash_btn.isEnabled()
+        assert win.upload_sketch(ask=False), "upload from the button failed"
+        assert fb.left_progmode and "uploaded" in win.ard_status.text(), win.ard_status.text()
+    finally:
+        upl.upload = real_upload
     win.cam_combo.setCurrentIndex(win.cam_combo.findData(TEST_PATTERN))
     win.res_combo.setCurrentIndex(1)
     win.cam_btn.click()
@@ -346,6 +377,7 @@ TESTS = [
     ("imports", t_imports),
     ("video codecs", t_video_codecs),
     ("picture adjustments", t_image),
+    ("Arduino firmware and uploader", t_firmware),
     ("serial packets", t_packets),
     ("TTL edges and clock fit", t_edges_and_clock),
     ("simulated Arduino stream", t_simulated_stream),

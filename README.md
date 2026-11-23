@@ -35,7 +35,18 @@ The installers are not code-signed:
 
 ## Arduino
 
-Upload `firmware/SyncCam_Arduino/SyncCam_Arduino.ino` once with the Arduino IDE (Arduino Uno or Nano).
+The Arduino needs the SyncCam sketch (it replaces e.g. Firmata):
+
+- **Uno or Nano:** SyncCam does it for you. Plug the board in, choose its port, and click
+  **Upload sketch** (or **Arduino → Upload sketch to board**). No Arduino IDE needed. It takes
+  a few seconds and checks the result.
+- **Other boards** (Nano Every, Uno R4, Leonardo, Mega): download `SyncCam-x.y.z-Arduino-sketch.zip`
+  from the release (or **Arduino → Save sketch (.ino)** in the app) and upload it with the
+  Arduino IDE.
+
+The sketch source is `firmware/SyncCam_Arduino/SyncCam_Arduino.ino`. After changing it, rebuild
+the bundled firmware with `python tools/build_firmware.py <ArduinoCore-avr folder>` (see the
+script for the one-time setup); the self-test fails if the two do not match.
 
 These are the default pins. You can pick other pins in the app (**Arduino → Pins**:
 TTL and microphone on any of A0–A7, IR LED on D2–D13). The choice is sent to the board each
