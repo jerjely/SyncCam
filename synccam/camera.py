@@ -108,11 +108,55 @@ class TestPatternSource:
 
 # --------------------------------------------------------------------------
 @dataclass
+class ImageSettings:
+    """Picture adjustments, applied in software (works the same with every camera)."""
+    grey: bool = True
+    brightness: int = 0        # -150 .. 150, added to every pixel
+    contrast: float = 1.0      # 0.2 .. 4, around mid-grey
+    gamma: float = 1.0         # 0.3 .. 3, >1 brightens the shadows
+
+    def is_identity(self) -> bool:
+        return self.brightness == 0 and abs(self.contrast - 1) < 1e-6 and abs(self.gamma - 1) < 1e-6
+
+    def lut(self) -> np.ndarray:
+        x = np.arange(256, dtype=np.float64) / 255.0
+        y = np.power(x, 1.0 / max(self.gamma, 1e-3)) * 255.0
+        y = (y - 128.0) * self.contrast + 128.0 + self.brightness
+        return np.clip(np.round(y), 0, 255).astype(np.uint8)
+
+    def as_dict(self) -> dict:
+        return {"greyscale": self.grey, "brightness": self.brightness,
+                "contrast": round(self.contrast, 3), "gamma": round(self.gamma, 3)}
+
+
+def process_image(img: np.ndarray, settings: ImageSettings, lut: Optional[np.ndarray] = None) -> np.ndarray:
+    """BGR camera image -> adjusted image (2-D uint8 if greyscale, else BGR)."""
+    cv2 = _cv2()
+    if settings.grey and img.ndim == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    if not settings.is_identity():
+        img = cv2.LUT(img, lut if lut is not None else settings.lut())
+    return img
+
+
+def auto_levels(img: np.ndarray) -> Tuple[int, float]:
+    """(brightness, contrast) that stretch the 1st..99th percentile of the picture to the full range."""
+    g = img if img.ndim == 2 else img.mean(axis=2)
+    lo, hi = np.percentile(g[::2, ::2], [1, 99])
+    if hi - lo < 4:
+        return 0, 1.0
+    contrast = float(np.clip(255.0 / (hi - lo), 0.2, 4.0))
+    brightness = int(np.clip(round(-128 - (lo - 128) * contrast), -150, 150))
+    return brightness, round(contrast, 2)
+
+
+@dataclass
 class Frame:
-    image: np.ndarray       # BGR
+    image: np.ndarray       # adjusted picture (2-D if greyscale): what the preview shows
     t: float                # perf_counter when read() returned
     n: int                  # frame number since the camera was opened
     roi_mean: float         # mean brightness in the LED ROI (nan if none)
+    raw: Optional[np.ndarray] = None   # untouched camera image (BGR)
 
 
 class CameraThread:
@@ -130,6 +174,8 @@ class CameraThread:
         self.frame_size: Tuple[int, int] = (0, 0)
         self.roi: Optional[Tuple[int, int, int, int]] = None     # x, y, w, h in image pixels
         self.on_frame: Optional[Callable[[Frame], None]] = None  # called in the capture thread
+        self._settings = ImageSettings()
+        self._lut = self._settings.lut()
         self._times: deque = deque(maxlen=120)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -176,6 +222,14 @@ class CameraThread:
     def running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
+    @property
+    def image_settings(self) -> ImageSettings:
+        return self._settings
+
+    def set_image_settings(self, settings: ImageSettings) -> None:
+        lut = settings.lut()
+        self._lut, self._settings = lut, settings      # swapped as a pair by reference
+
     def measured_fps(self) -> float:
         ts = list(self._times)
         if len(ts) < 5:
@@ -204,7 +258,8 @@ class CameraThread:
                     time.sleep(0.01)
                     continue
                 fails = 0
-                frame = Frame(img, t, n, self._roi_mean(img))
+                settings, lut = self._settings, self._lut
+                frame = Frame(process_image(img, settings, lut), t, n, self._roi_mean(img), img)
                 n += 1
                 self._times.append(t)
                 self.latest = frame
@@ -219,11 +274,18 @@ class CameraThread:
 class VideoWriterThread:
     """Writes frames from a queue; drops (and counts) frames if the disk falls behind."""
 
-    def __init__(self, path: str, fps: float, size: Tuple[int, int], codec: str = "MJPG", maxq: int = 240):
+    def __init__(self, path: str, fps: float, size: Tuple[int, int], codec: str = "MJPG", maxq: int = 240,
+                 grey: bool = False):
         cv2 = _cv2()
         fourcc, _ext = CODECS.get(codec, CODECS["MJPG"])
         self.path = path
-        self.writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*fourcc), float(fps), size)
+        self.grey = grey
+        self._expand = False          # grey frames written as 3-channel (writer without grey support)
+        cc = cv2.VideoWriter_fourcc(*fourcc)
+        self.writer = cv2.VideoWriter(path, cc, float(fps), size, isColor=not grey)
+        if grey and not self.writer.isOpened():
+            self.writer = cv2.VideoWriter(path, cc, float(fps), size, isColor=True)
+            self._expand = True
         if not self.writer.isOpened():
             raise RuntimeError(f"Could not create the video file {path} with codec {codec}.")
         self.size = size
@@ -252,6 +314,10 @@ class VideoWriterThread:
                     break
                 if (img.shape[1], img.shape[0]) != self.size:
                     img = cv2.resize(img, self.size)
+                if self.grey and img.ndim == 3:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                if img.ndim == 2 and (self._expand or not self.grey):
+                    img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
                 self.writer.write(img)
                 self.written += 1
         except Exception as exc:

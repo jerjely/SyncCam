@@ -84,6 +84,31 @@ def t_video_codecs(ctx):
         assert n == 15, f"{codec}: wrote 15 frames, read back {n}"
 
 
+def t_image(ctx):
+    from .camera import ImageSettings, auto_levels, process_image
+    img = np.zeros((60, 80, 3), np.uint8)
+    img[:, :40] = (60, 100, 140)
+    img[:, 40:] = (90, 130, 170)
+    st = ImageSettings()
+    assert st.grey and st.is_identity(), "greyscale should be the default, with no adjustment"
+    g = process_image(img, st)
+    assert g.ndim == 2 and g.shape == (60, 80), g.shape
+    col = process_image(img, ImageSettings(grey=False))
+    assert col.shape == img.shape and np.array_equal(col, img)
+    lut = ImageSettings(brightness=20).lut()
+    assert lut[100] == 120 and lut[250] == 255
+    lut = ImageSettings(contrast=2.0).lut()
+    assert lut[128] == 128 and lut[160] == 192 and lut[0] == 0
+    lut = ImageSettings(gamma=2.0).lut()
+    assert lut[0] == 0 and lut[255] == 255 and lut[64] > 64
+    img2 = np.zeros((60, 80, 3), np.uint8)
+    img2[:, :40], img2[:, 40:] = 70, 170          # dull picture: grey levels 70..170
+    g = process_image(img2, st)
+    b, c = auto_levels(g)
+    stretched = process_image(img2, ImageSettings(brightness=b, contrast=c))
+    assert stretched.min() <= 10 and stretched.max() >= 245, (b, c, stretched.min(), stretched.max())
+
+
 def t_packets(ctx):
     from .arduino import PacketParser, SeqUnwrapper, encode_packet
     pk = b"".join(encode_packet(i, (7 * i) % 1024, (13 * i) % 1024, i % 2, i % 3 == 0) for i in range(700))
@@ -181,6 +206,12 @@ def t_recording(ctx):
     n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     cap.release()
     assert abs(n - len(frames)) <= 1, f"video has {n} frames, frames.csv {len(frames)}"
+    cap = cv2.VideoCapture(str(folder / "video.avi"))
+    ok, first = cap.read()
+    cap.release()
+    assert ok and (first.ndim == 2 or (np.abs(first[..., 0].astype(int) - first[..., 2]).max() <= 2)), \
+        "the default recording should be greyscale"
+    assert js["video"]["image_adjustments"]["greyscale"] is True
     with wave.open(str(folder / "analog.wav")) as w:
         assert w.getnchannels() == 3 and w.getframerate() == 5000
         ns = w.getnframes()
@@ -253,9 +284,30 @@ def t_gui(ctx):
     win.ir_btn.click()
     assert win.stream is not None, "simulated Arduino did not connect"
     _pump(app, lambda: win.camera.latest is not None and win.stream.total > 2000, 5, "camera and Arduino data")
-    assert win.ir_btn.text() == "IR LED: ON"
+    assert win.ir_btn.text() == "IR LED (D8): ON", win.ir_btn.text()
     _pump(app, lambda: win.stream.last_led, 3, "IR LED on")
     assert win.rec_btn.isEnabled()
+    assert win.camera.latest.image.ndim == 2, "preview should be greyscale by default"
+    win.sliders["contrast"][0].setValue(150)
+    _pump(app, lambda: win.camera.image_settings.contrast == 1.5, 2, "contrast setting")
+    win.auto_btn.click()
+    win.grey_chk.setChecked(False)
+    _pump(app, lambda: win.camera.latest.image.ndim == 3, 2, "colour preview")
+    win.grey_chk.setChecked(True)
+    _pump(app, lambda: win.camera.latest.image.ndim == 2, 2, "greyscale preview")
+    win.window_combo.setCurrentIndex(win.window_combo.findData(0.1))
+    win.mic_combo.setCurrentIndex(win.mic_combo.findData(64))
+    assert win.scope.window_s == 0.1 and win.scope.mic_scale == 64
+    win._scope_wheel("window", 1)
+    assert win.scope.window_s == 0.25
+    app.processEvents()
+    win.grab()                                   # paints the zoomed-in plot
+    win.freeze_btn.click()
+    frozen = win.scope.data.copy()
+    t_f = time.time() + 0.3
+    _pump(app, lambda: time.time() > t_f, 2, "frozen plot")
+    assert np.array_equal(win.scope.data, frozen), "frozen plot kept updating"
+    win.freeze_btn.click()
     win.rec_btn.click()
     assert win.recording is not None
     t_end = time.time() + 2.5
@@ -272,6 +324,13 @@ def t_gui(ctx):
     assert js["video"]["frames"] > 40 and js["arduino"]["samples"] > 10000, js
     assert js["ir_led_at_start"] == "on"
     assert js["arduino"]["pins"] == {"ttl": "A5", "microphone": "A1", "ir_led": "D8"}, js["arduino"]["pins"]
+    # short screen (small laptop / Windows scaling): nothing squashed, Record still visible
+    win.resize(1100, 560)
+    t_end = time.time() + 0.3
+    _pump(app, lambda: time.time() > t_end, 2, "resize")
+    for b in (win.rec_btn, win.cam_btn, win.ard_btn, win.ir_btn):
+        assert b.height() >= b.minimumSizeHint().height() - 1, f"{b.text()} squashed to {b.height()} px"
+    assert not win.rec_btn.visibleRegion().isEmpty(), "Record button scrolled out of view"
     win.close()
     app.processEvents()
 
@@ -280,6 +339,7 @@ TESTS = [
     ("version", t_version),
     ("imports", t_imports),
     ("video codecs", t_video_codecs),
+    ("picture adjustments", t_image),
     ("serial packets", t_packets),
     ("TTL edges and clock fit", t_edges_and_clock),
     ("simulated Arduino stream", t_simulated_stream),

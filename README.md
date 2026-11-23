@@ -59,7 +59,13 @@ reported. Commands are documented at the top of the sketch.
    Set the TTL threshold (default 2.5 V). The red dashed line in the TTL plot shows it.
 3. **IR LED:** click the button to switch it on or off. It stays as you set it, and SyncCam remembers
    the setting next time you connect.
-4. **Recording:** choose a folder and a name, then **Record** and **Stop recording**.
+4. **Picture:** under the preview, **Greyscale** is on by default. Adjust **Brightness**, **Contrast**
+   and **Gamma**, or click **Auto** to set brightness and contrast from the current picture. With
+   **Record the adjusted picture** ticked (the default), the video file looks like the preview. Untick it
+   to record the camera's original image and use the adjustments only for viewing.
+5. **Signals:** choose how much to show (50 ms to 10 s) and the microphone scale, or use the mouse
+   wheel over the plot (Shift + wheel for the microphone). **Freeze** holds the plot so you can look closely.
+6. **Recording:** choose a folder and a name, then **Record** and **Stop recording**.
 
 **Simulator (no hardware)** and **Test pattern (no camera)** let you try everything without hardware.
 
@@ -74,7 +80,7 @@ Each recording goes into its own folder, `<name>_<date>_<time>/`:
 | `ttl_events.csv` | Every TTL rising and falling edge: `sample`, `time_s`, `video_frame`, `frame_time_s` |
 | `microphone.wav` | The microphone, centred and amplified so you can listen to it |
 | `analog.wav` | 3 channels at the sample rate, raw values: TTL (0–1023), microphone (0–1023), IR LED (0/1) |
-| `session.json` | Settings, measured frame rate, Arduino clock fit, drop counts |
+| `session.json` | Settings (including pins and picture adjustments), measured frame rate, Arduino clock fit, drop counts |
 
 All `time_s` values are seconds since **Record** was pressed, on the computer's clock.
 Arduino sample *n* happened at `first_sample_time_s + n / measured_rate_hz` (both in `session.json`).

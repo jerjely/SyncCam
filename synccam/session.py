@@ -43,7 +43,7 @@ def safe_name(text: str) -> str:
 class Recording:
     def __init__(self, out_dir: str, name: str, camera: Optional[CameraThread],
                  stream: Optional[ArduinoStream], codec: str = "MJPG",
-                 ttl_threshold: int = 512, extra: Optional[dict] = None):
+                 ttl_threshold: int = 512, extra: Optional[dict] = None, adjust_video: bool = True):
         if camera is None and stream is None:
             raise ValueError("Nothing to record: open a camera or connect the Arduino.")
         self.started_wall = datetime.now().astimezone()
@@ -53,6 +53,8 @@ class Recording:
         self.codec = codec
         self.ttl_threshold = int(ttl_threshold)
         self.extra = extra or {}
+        self.adjust_video = adjust_video
+        self.image_changed = False
         self.t0 = 0.0
         self.t_stop: Optional[float] = None
         self._lock = threading.Lock()
@@ -84,8 +86,10 @@ class Recording:
             fps = self.camera.measured_fps() or float(self.camera.fps_req or 30.0)
             self.video_fps = round(fps, 3)
             ext = CODECS.get(self.codec, CODECS["MJPG"])[1]
+            self.image_at_start = self.camera.image_settings
+            grey = self.adjust_video and self.image_at_start.grey
             self.writer = VideoWriterThread(str(self.folder / f"video{ext}"), self.video_fps,
-                                            self.camera.frame_size, self.codec)
+                                            self.camera.frame_size, self.codec, grey=grey)
             self.camera.on_frame = self._on_frame
         if self.stream is not None:
             fs = self.stream.fs
@@ -109,7 +113,8 @@ class Recording:
         if f.t < self.t0 or self.t_stop is not None:
             return
         self.frames_seen += 1
-        if self.writer.put(f.image):
+        img = f.image if (self.adjust_video or f.raw is None) else f.raw
+        if self.writer.put(img):
             self.frame_t.append(f.t)
 
     def _on_samples(self, idx: np.ndarray, vals: np.ndarray, t: float) -> None:
@@ -231,6 +236,9 @@ class Recording:
                 "frames": n,
                 "frames_dropped_disk": self.writer.dropped,
                 "writer_error": self.writer.error,
+                "image_adjustments": (self.image_at_start.as_dict() if self.adjust_video
+                                      else "none (raw camera picture recorded)"),
+                "image_adjustments_changed_during_recording": self.image_changed and self.adjust_video,
                 "note": "Use frames.csv for frame times, not the file's nominal frame rate.",
             }
             wall0 = self.started_wall
