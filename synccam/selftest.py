@@ -118,9 +118,12 @@ def t_edges_and_clock(ctx):
 
 def t_simulated_stream(ctx):
     from .arduino import IR_OFF, IR_ON, ArduinoStream, SimulatedArduino
+    from .arduino import parse_identify
     st = ArduinoStream(SimulatedArduino(), 5000)
-    info = st.connect(IR_OFF)
-    assert info.firmware.startswith("SYNCCAM"), info.firmware
+    info = st.connect(IR_OFF, pins=(5, 2, 9))
+    ident = parse_identify(info.firmware)
+    assert ident["version"] == 2 and ident["ttl"] == "A5" and ident["mic"] == "A2" and ident["ir"] == "D9", \
+        info.firmware
     time.sleep(1.1)
     d = st.recent(1.0)
     assert st.error is None, st.error
@@ -142,10 +145,10 @@ def t_serial_commands(ctx):
     from .arduino import SerialArduino
     dev = SerialArduino("loop://")
     dev.open()
-    dev.write(b"P1000,50\nI3\n")
+    dev.write(b"A5,1\nL9\nI1\n")
     time.sleep(0.05)
     got = dev.read() + dev.read()
-    assert b"P1000,50\nI3\n" in got, got
+    assert b"A5,1\nL9\nI1\n" in got, got
     dev.close()
 
 
@@ -245,6 +248,7 @@ def t_gui(ctx):
     win.cam_btn.click()
     assert win.camera is not None, "test-pattern camera did not open"
     win.port_combo.setCurrentIndex(win.port_combo.findData(SIM_PORT))
+    win.ttl_pin.setCurrentIndex(win.ttl_pin.findData(5))
     win.ard_btn.click()
     win.ir_btn.click()
     assert win.stream is not None, "simulated Arduino did not connect"
@@ -267,6 +271,7 @@ def t_gui(ctx):
     js = json.loads((win.last_folder / "session.json").read_text(encoding="utf-8"))
     assert js["video"]["frames"] > 40 and js["arduino"]["samples"] > 10000, js
     assert js["ir_led_at_start"] == "on"
+    assert js["arduino"]["pins"] == {"ttl": "A5", "microphone": "A1", "ir_led": "D8"}, js["arduino"]["pins"]
     win.close()
     app.processEvents()
 

@@ -18,8 +18,8 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QDoubleSpinBox, QFileDia
 
 from . import APP_AUTHOR, APP_NAME, APP_URL, __version__
 from .app import resource_path
-from .arduino import (IR_OFF, IR_ON, SAMPLE_RATES, SIM_PORT, ArduinoStream, SimulatedArduino,
-                      list_serial_ports, make_arduino)
+from .arduino import (ANALOG_PINS, DEFAULT_PINS, IR_OFF, IR_ON, IR_PINS, SAMPLE_RATES, SIM_PORT,
+                      ArduinoStream, SimulatedArduino, list_serial_ports, make_arduino)
 from .camera import CODECS, RESOLUTIONS, TEST_PATTERN, CameraThread, scan_cameras
 from .session import Recording
 
@@ -167,6 +167,12 @@ class ScopeWidget(QWidget):
         self.fs = 5000
         self.threshold = 512
         self.message = "Arduino not connected"
+        self.lanes = list(self.LANES)
+
+    def set_pins(self, ttl: int, mic: int) -> None:
+        self.lanes = [(f"TTL (A{ttl})", self.LANES[0][1]), (f"Microphone (A{mic})", self.LANES[1][1]),
+                      self.LANES[2]]
+        self.update()
 
     def set_data(self, data: np.ndarray, fs: int) -> None:
         self.data, self.fs = data, fs
@@ -183,7 +189,7 @@ class ScopeWidget(QWidget):
         width = max(10, right - left)
         n_win = int(SCOPE_S * self.fs)
         d = self.data[-n_win:]
-        for k, (name, colour) in enumerate(self.LANES):
+        for k, (name, colour) in enumerate(self.lanes):
             top = 8 + k * lane_h
             p.setPen(QColor("#5a6482"))
             p.drawText(QRectF(10, top, left - 16, lane_h), int(Qt.AlignmentFlag.AlignVCenter), name)
@@ -257,6 +263,7 @@ class MainWindow(QMainWindow):
         self._restore_settings()
         self.refresh_ports()
         self._ir_toggled()
+        self._pins_changed()
         self._update_enabled()
         self._timer = QTimer(self)
         self._timer.setInterval(33)
@@ -336,6 +343,26 @@ class MainWindow(QMainWindow):
         row.addWidget(QLabel("TTL at"))
         row.addWidget(self.thr_spin)
         form.addRow("Sampling", row)
+        self.ttl_pin = QComboBox()
+        self.mic_pin = QComboBox()
+        for combo in (self.ttl_pin, self.mic_pin):
+            for n in ANALOG_PINS:
+                combo.addItem(f"A{n}", n)
+        self.ir_pin = QComboBox()
+        for n in IR_PINS:
+            self.ir_pin.addItem(f"D{n}", n)
+        self.ttl_pin.setCurrentIndex(self.ttl_pin.findData(DEFAULT_PINS[0]))
+        self.mic_pin.setCurrentIndex(self.mic_pin.findData(DEFAULT_PINS[1]))
+        self.ir_pin.setCurrentIndex(self.ir_pin.findData(DEFAULT_PINS[2]))
+        self.ttl_pin.setToolTip("Analog input with the TTL sync signal")
+        self.mic_pin.setToolTip("Analog input with the microphone (A6/A7: Nano only)")
+        self.ir_pin.setToolTip("Digital pin that drives the IR LED")
+        row = QHBoxLayout()
+        row.setSpacing(4)
+        for lab, combo in (("TTL", self.ttl_pin), ("Mic", self.mic_pin), ("IR", self.ir_pin)):
+            row.addWidget(QLabel(lab))
+            row.addWidget(combo, 1)
+        form.addRow("Pins", row)
         self.ard_btn = QPushButton("Connect")
         self.ard_btn.setObjectName("primary")
         form.addRow(self.ard_btn)
@@ -352,8 +379,8 @@ class MainWindow(QMainWindow):
         self.ir_btn.setCheckable(True)
         self.ir_btn.setMinimumHeight(36)
         v.addWidget(self.ir_btn)
-        v.addWidget(hint("Switched by the Arduino (pin D8). It stays as you set it until you switch it "
-                         "or disconnect."))
+        self.ir_hint = hint("")
+        v.addWidget(self.ir_hint)
         left.addWidget(box)
 
         # 4 recording
@@ -384,7 +411,7 @@ class MainWindow(QMainWindow):
         self.rec_status = QLabel("Not recording.")
         self.rec_status.setWordWrap(True)
         self.rec_status.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
-        self.rec_status.setMinimumHeight(4 * self.rec_status.fontMetrics().lineSpacing() + 4)
+        self.rec_status.setMinimumHeight(3 * self.rec_status.fontMetrics().lineSpacing() + 4)
         v.addWidget(self.rec_status)
         left.addWidget(box)
         left.addStretch(1)
@@ -414,6 +441,8 @@ class MainWindow(QMainWindow):
         self.refresh_btn.clicked.connect(self.refresh_ports)
         self.ard_btn.clicked.connect(self._toggle_arduino)
         self.ir_btn.toggled.connect(self._ir_toggled)
+        for combo in (self.ttl_pin, self.mic_pin, self.ir_pin):
+            combo.currentIndexChanged.connect(self._pins_changed)
         self.thr_spin.valueChanged.connect(self._threshold_changed)
         self.dir_btn.clicked.connect(self._pick_dir)
         self.rec_btn.clicked.connect(self._toggle_record)
@@ -455,6 +484,9 @@ class MainWindow(QMainWindow):
         pick(self.res_combo, "resolution")
         pick(self.codec_combo, "codec")
         pick(self.rate_combo, "rate")
+        pick(self.ttl_pin, "ttl_pin")
+        pick(self.mic_pin, "mic_pin")
+        pick(self.ir_pin, "ir_pin")
         self.ir_btn.setChecked(str(s.value("ir_on", "false")).lower() == "true")
         for spin, key, cast in ((self.fps_spin, "fps", int), (self.thr_spin, "threshold", float)):
             val = s.value(key)
@@ -479,6 +511,9 @@ class MainWindow(QMainWindow):
         s.setValue("resolution", str(self.res_combo.currentData()))
         s.setValue("codec", self.codec_combo.currentData())
         s.setValue("rate", self.rate_combo.currentData())
+        s.setValue("ttl_pin", self.ttl_pin.currentData())
+        s.setValue("mic_pin", self.mic_pin.currentData())
+        s.setValue("ir_pin", self.ir_pin.currentData())
         s.setValue("ir_on", self.ir_btn.isChecked())
         s.setValue("fps", self.fps_spin.value())
         s.setValue("threshold", self.thr_spin.value())
@@ -578,12 +613,16 @@ class MainWindow(QMainWindow):
         port = self.port_combo.currentData()
         if not port:
             return False
+        pins = self._pins()
+        if pins[0] == pins[1]:
+            QMessageBox.warning(self, "Pins", "The TTL and the microphone need different analog inputs.")
+            return False
         st = ArduinoStream(make_arduino(port), int(self.rate_combo.currentData()))
         self.ard_status.setText("Connecting (the Arduino restarts, about 2 s)...")
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         QApplication.processEvents()
         try:
-            st.connect(self._ir_mode(), ttl_threshold=self._threshold_adc())
+            st.connect(self._ir_mode(), ttl_threshold=self._threshold_adc(), pins=pins)
         except Exception as exc:
             self.ard_status.setText("")
             QMessageBox.critical(self, "Cannot connect", f"{port}:\n\n{exc}\n\nIs another program "
@@ -601,6 +640,15 @@ class MainWindow(QMainWindow):
             st.close()
         self.scope.set_data(np.zeros((0, 3), dtype=np.int16), 5000)
         self._update_enabled()
+
+    def _pins(self):
+        return (int(self.ttl_pin.currentData()), int(self.mic_pin.currentData()),
+                int(self.ir_pin.currentData()))
+
+    def _pins_changed(self, *_a) -> None:
+        ttl, mic, ir = self._pins()
+        self.scope.set_pins(ttl, mic)
+        self.ir_hint.setText(f"On pin D{ir}. Stays as set until you switch it.")
 
     def _ir_mode(self) -> int:
         return IR_ON if self.ir_btn.isChecked() else IR_OFF
@@ -730,9 +778,14 @@ class MainWindow(QMainWindow):
             data = st.recent(SCOPE_S)
             self.scope.threshold = self._threshold_adc()
             self.scope.set_data(data, st.fs)
+            err = st.clock.rate_error()
+            slow = err is not None and abs(err) > 0.01
             self.ard_status.setText(f'<span style="color:#1a9a4a">&#9679;</span> {st.device.name}, '
                                     f"{st.fs} Hz, {st.total:,} samples"
-                                    + (f", {st.unwrap.dropped} lost" if st.unwrap.dropped else ""))
+                                    + (f", {st.unwrap.dropped} lost" if st.unwrap.dropped else "")
+                                    + (f'<br><span style="color:#a32035">Board only reaches '
+                                       f"{st.fs * (1 + err):.0f} Hz: choose a lower sample rate.</span>"
+                                       if slow else ""))
             if len(data):
                 ttl_v = data[-1, 0] / 1023 * 5
                 mic = data[-st.fs // 5:, 1].astype(float)
@@ -765,7 +818,7 @@ class MainWindow(QMainWindow):
         self.cam_btn.setEnabled(not rec)
         if not cam:
             self.cam_status.setText('<span style="color:#8a93ad">&#9679;</span> No camera open')
-        for w in (self.port_combo, self.refresh_btn, self.rate_combo):
+        for w in (self.port_combo, self.refresh_btn, self.rate_combo, self.ttl_pin, self.mic_pin, self.ir_pin):
             w.setEnabled(not ard)
         self.ard_btn.setText("Disconnect" if ard else "Connect")
         self.ard_btn.setEnabled(not rec)

@@ -205,9 +205,14 @@ class Recording:
                 "samples": self.n_samples,
                 "samples_lost_and_filled": self.filled,
                 "measured_rate_hz": round(1.0 / per, 4),
+                "rate_warning": ("The Arduino did not keep up with the chosen sample rate. Use "
+                                 "measured_rate_hz (not the WAV header rate) for timing, or pick a "
+                                 "lower rate." if abs(per * self.stream.fs - 1) > 0.01 else None),
                 "first_sample_time_s": round(off + self.idx0 * per - self.t0, 6),
                 "clock_fit": "time_s = first_sample_time_s + sample / measured_rate_hz",
                 "ttl_threshold_adc": self.ttl_threshold,
+                "pins": {"ttl": f"A{self.stream.pins[0]}", "microphone": f"A{self.stream.pins[1]}",
+                         "ir_led": f"D{self.stream.pins[2]}"},
                 "analog_wav_channels": ["TTL (A0, raw 0-1023)", "microphone (A1, raw 0-1023)",
                                         "IR LED (0/1)"],
             }

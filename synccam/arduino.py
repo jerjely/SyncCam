@@ -23,6 +23,25 @@ SAMPLE_RATES = [1000, 2000, 5000, 8000, 10000]
 IR_OFF, IR_ON, IR_FOLLOW, IR_PULSE = 0, 1, 2, 3
 IR_MODE_NAMES = {IR_OFF: "Off", IR_ON: "On", IR_FOLLOW: "Follow TTL", IR_PULSE: "Pulses"}
 
+ANALOG_PINS = list(range(8))           # A0..A7 (A6/A7: Nano and Pro Mini only)
+IR_PINS = list(range(2, 14))           # D2..D13
+DEFAULT_PINS = (0, 1, 8)               # TTL A0, microphone A1, IR LED D8
+
+
+def pin_label(kind: str, n: int) -> str:
+    return f"A{n}" if kind == "analog" else f"D{n}"
+
+
+def parse_identify(line: str) -> dict:
+    """'SYNCCAM 2 fs=5000 ttl=A5 mic=A1 ir=D8' -> {'version': 2, 'fs': '5000', 'ttl': 'A5', ...}"""
+    parts = line.split()
+    out = {"version": int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0}
+    for p in parts[2:]:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            out[k] = v
+    return out
+
 
 # --------------------------------------------------------------------------
 # Packets
@@ -180,6 +199,7 @@ class SimulatedArduino:
         self.pulse_width_s = 0.05
         self.ttl_threshold = 512
         self.led = False
+        self.ttl_ch, self.mic_ch, self.ir_pin = DEFAULT_PINS
         self._t0 = 0.0
         self._n = 0
         self._pulse_t0 = time.perf_counter()
@@ -212,7 +232,8 @@ class SimulatedArduino:
         c, rest = line[0], line[1:]
         with self._lock:
             if c == "?" and not self.streaming:
-                self._out += f"SYNCCAM 1 fs={self.fs}\n".encode()
+                self._out += (f"SYNCCAM 2 fs={self.fs} ttl=A{self.ttl_ch} mic=A{self.mic_ch} "
+                              f"ir=D{self.ir_pin}\n").encode()
             elif c == "S":
                 self._generate(time.perf_counter())
                 self.streaming = True
@@ -237,6 +258,15 @@ class SimulatedArduino:
                     self._pulse_t0 = time.perf_counter()
             elif c == "T" and rest.isdigit():
                 self.ttl_threshold = int(rest)
+            elif c == "A" and not self.streaming:
+                try:
+                    t, m = (int(x) for x in rest.split(","))
+                except ValueError:
+                    return
+                if 0 <= t <= 7 and 0 <= m <= 7:
+                    self.ttl_ch, self.mic_ch = t, m
+            elif c == "L" and not self.streaming and rest.isdigit() and 2 <= int(rest) <= 13:
+                self.ir_pin = int(rest)
 
     @staticmethod
     def ttl_at(t: np.ndarray) -> np.ndarray:
@@ -341,6 +371,13 @@ class ClockFit:
     def add(self, idx: int, t: float) -> None:
         self.pairs.append((idx, t))
 
+    def rate_error(self) -> Optional[float]:
+        """Measured / nominal sample rate - 1, once there is enough data (None before)."""
+        if len(self.pairs) < 2 or self.pairs[-1][0] - self.pairs[0][0] < self.fs * 3:
+            return None
+        _, period = self.solve()
+        return (1.0 / period) / self.fs - 1.0
+
     def solve(self) -> Tuple[float, float]:
         """(offset_s, period_s)."""
         if len(self.pairs) < 2:
@@ -355,7 +392,7 @@ class ClockFit:
             period = 1.0 / self.fs
         else:
             period = float(np.polyfit(x - x.mean(), y, 1)[0])
-            if not (0.98 / self.fs < period < 1.02 / self.fs):
+            if not (0.5 / self.fs < period < 2.0 / self.fs):
                 period = 1.0 / self.fs
         resid = y - x * period
         offset = float(np.percentile(resid, 2))
@@ -405,6 +442,7 @@ class ArduinoStream:
         self.device = device
         self.fs = int(fs)
         self.info: Optional[ArduinoInfo] = None
+        self.pins: Tuple[int, int, int] = DEFAULT_PINS
         self.parser = PacketParser()
         self.unwrap = SeqUnwrapper()
         self.clock = ClockFit(self.fs)
@@ -424,7 +462,7 @@ class ArduinoStream:
 
     # ---- setup -----------------------------------------------------------
     def connect(self, ir_mode: int = IR_OFF, pulse_ms: Tuple[int, int] = (1000, 50),
-                ttl_threshold: int = 512) -> ArduinoInfo:
+                ttl_threshold: int = 512, pins: Tuple[int, int, int] = DEFAULT_PINS) -> ArduinoInfo:
         dev = self.device
         dev.open()
         if dev.needs_reset_wait:
@@ -442,6 +480,25 @@ class ArduinoStream:
             dev.close()
             raise RuntimeError("No answer from the SyncCam sketch. Is firmware/SyncCam_Arduino uploaded, "
                                f"and is this the right port? (got {line!r})")
+        ttl, mic, ir = (int(x) for x in pins)
+        ident = parse_identify(line)
+        if ident["version"] >= 2:
+            dev.write(f"A{ttl},{mic}\nL{ir}\n".encode())
+            time.sleep(0.02)
+            dev.reset_input()
+            dev.write(b"?\n")
+            line = dev.readline(1.0) or line
+            ident = parse_identify(line)
+            want = {"ttl": f"A{ttl}", "mic": f"A{mic}", "ir": f"D{ir}"}
+            if any(ident.get(k) != v for k, v in want.items()):
+                dev.close()
+                raise RuntimeError(f"The Arduino did not accept these pins (it reports {line!r}). "
+                                   "This board may not have A6/A7, or the IR pin is not between D2 and D13.")
+        elif tuple(pins) != DEFAULT_PINS:
+            dev.close()
+            raise RuntimeError("This Arduino has the old SyncCam sketch, which only uses A0 (TTL), A1 "
+                               "(microphone) and D8 (IR LED). Upload the new sketch to choose other pins.")
+        self.pins = (ttl, mic, ir)
         self.set_ir(ir_mode, pulse_ms)
         self.set_threshold(ttl_threshold)
         dev.write(f"F{self.fs}\n".encode())

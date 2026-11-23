@@ -1,11 +1,12 @@
 /*
   SyncCam_Arduino - analog front end for the SyncCam app.
-  Board: Arduino Uno / Nano (ATmega328P, 16 MHz). Upload once with the Arduino IDE.
+  Boards: Arduino Uno / Nano (ATmega328P), Nano Every, Uno R4 Minima / WiFi, Leonardo, Mega.
+  Upload once with the Arduino IDE.
 
-  Wiring
+  Wiring (defaults; the pins can be changed from the SyncCam app, no re-upload needed)
     A0  <- TTL sync signal (the same TTL that goes to the Neuropixels / OneBox), 0-5 V
     A1  <- microphone module analog output (e.g. MAX4466 / MAX9814, biased at ~2.5 V)
-    D8  -> IR LED (through a resistor or a transistor/MOSFET driver), visible to the camera
+    D8  -> IR LED (through a resistor or a transistor/MOSFET driver)
     GND -- common ground with the TTL source and the microphone
 
   Serial: 1 000 000 baud. While streaming, every sample is one 6-byte packet:
@@ -18,20 +19,35 @@
       seq = sample counter modulo 256, chk = 0x5A ^ seq ^ b0 ^ b1 ^ b2
 
   Commands from the computer (ASCII, one per line, ending with '\n'):
-    ?            identify (only answered while NOT streaming): "SYNCCAM 1 fs=5000"
+    ?            identify (only answered while NOT streaming):
+                 "SYNCCAM 2 fs=5000 ttl=A0 mic=A1 ir=D8"
     S            start streaming (sample counter restarts at 0)
     X            stop streaming
     F<hz>        sample rate, 100..10000 Hz   (e.g. F5000)
     I<m>         IR LED mode: 0 off, 1 on, 2 follow the TTL, 3 periodic pulses
     P<per>,<w>   pulse period and width in ms for mode 3 (e.g. P1000,50)
     T<thr>       TTL threshold in ADC units 0..1023 (default 512 = 2.5 V)
+    A<t>,<m>     analog inputs for TTL and microphone, 0..7 = A0..A7 (e.g. A5,1)
+                 (A6/A7 only on boards that have them, e.g. Nano, Nano Every)
+    L<pin>       digital pin for the IR LED, 2..13 (e.g. L8)
 */
 
-const uint8_t TTL_PIN = A0;
-const uint8_t MIC_PIN = A1;
-const uint8_t IR_PIN = 8;
+// analog inputs this board has, so channel n means pin An on every board
+const uint8_t ANALOG_PINS[] = {A0, A1, A2, A3, A4, A5
+#if defined(PIN_A6)
+                               , A6
+#endif
+#if defined(PIN_A7)
+                               , A7
+#endif
+};
+const uint8_t N_ANALOG = sizeof(ANALOG_PINS);
+
+uint8_t ttlCh = 0;              // index into ANALOG_PINS: 0 = A0, 5 = A5, ...
+uint8_t micCh = 1;
+uint8_t irPin = 8;               // digital pin
 const unsigned long BAUD = 1000000UL;
-const uint8_t PROTOCOL_VERSION = 1;
+const uint8_t PROTOCOL_VERSION = 2;
 
 bool streaming = false;
 unsigned long fsHz = 5000;
@@ -51,10 +67,25 @@ bool ttlHigh = false;
 char line[24];
 uint8_t lineLen = 0;
 
+// 10-bit readings on every board (the Uno R4 can do more, but the packet holds 10 bits)
+void analogReadResolution10() {
+#if defined(ARDUINO_ARCH_RENESAS) || defined(ARDUINO_ARCH_SAMD) || defined(ARDUINO_ARCH_MBED)
+  analogReadResolution(10);
+#endif
+}
+
+// Read an input twice and keep the second value. The ADC's sample capacitor keeps some
+// charge from the previously read input; the throw-away read removes that cross-talk
+// (otherwise the TTL leaks into the microphone channel, worst when an input is unconnected).
+int readAnalog(uint8_t ch) {
+  analogRead(ANALOG_PINS[ch]);
+  return analogRead(ANALOG_PINS[ch]);
+}
+
 void setIr(bool on) {
   if (on != irState) {
     irState = on;
-    digitalWrite(IR_PIN, on ? HIGH : LOW);
+    digitalWrite(irPin, on ? HIGH : LOW);
   }
 }
 
@@ -81,7 +112,13 @@ void handleLine() {
         Serial.print(F("SYNCCAM "));
         Serial.print(PROTOCOL_VERSION);
         Serial.print(F(" fs="));
-        Serial.println(fsHz);
+        Serial.print(fsHz);
+        Serial.print(F(" ttl=A"));
+        Serial.print(ttlCh);
+        Serial.print(F(" mic=A"));
+        Serial.print(micCh);
+        Serial.print(F(" ir=D"));
+        Serial.println(irPin);
       }
       break;
     case 'S':
@@ -117,6 +154,24 @@ void handleLine() {
     case 'T':
       if (v >= 1 && v <= 1022) ttlThreshold = (int)v;
       break;
+    case 'A': {
+      char *comma = strchr(line, ',');
+      long m = comma ? atol(comma + 1) : -1;
+      if (!streaming && v >= 0 && v < N_ANALOG && m >= 0 && m < N_ANALOG) {
+        ttlCh = (uint8_t)v;
+        micCh = (uint8_t)m;
+      }
+      break;
+    }
+    case 'L':
+      if (!streaming && v >= 2 && v <= 13 && v != irPin) {
+        digitalWrite(irPin, LOW);
+        pinMode(irPin, INPUT);
+        irPin = (uint8_t)v;
+        pinMode(irPin, OUTPUT);
+        digitalWrite(irPin, irState ? HIGH : LOW);
+      }
+      break;
   }
 }
 
@@ -133,11 +188,16 @@ void readCommands() {
 }
 
 void setup() {
-  pinMode(IR_PIN, OUTPUT);
-  digitalWrite(IR_PIN, LOW);
-  // ADC clock prescaler 16 (1 MHz): one analogRead takes ~13 us instead of ~112 us,
-  // which allows both channels at up to 10 kHz with 10-bit values.
+  pinMode(irPin, OUTPUT);
+  digitalWrite(irPin, LOW);
+  // Faster ADC clock where the board allows it: one analogRead takes ~13 us instead of
+  // ~110 us, which allows both channels at up to 10 kHz with 10-bit values.
+#if defined(ADCSRA)                                   // Uno, Nano, Leonardo, Mega
   ADCSRA = (ADCSRA & ~0x07) | 0x04;
+#elif defined(ADC0) && defined(ADC_PRESC_gm)          // Nano Every (ATmega4809)
+  ADC0.CTRLC = (ADC0.CTRLC & ~ADC_PRESC_gm) | ADC_PRESC_DIV16_gc;
+#endif
+  analogReadResolution10();
   Serial.begin(BAUD);
 }
 
@@ -146,8 +206,8 @@ void loop() {
   unsigned long now = micros();
   if (streaming && (long)(now - nextSampleUs) >= 0) {
     nextSampleUs += periodUs;
-    int a0 = analogRead(TTL_PIN);
-    int a1 = analogRead(MIC_PIN);
+    int a0 = readAnalog(ttlCh);
+    int a1 = readAnalog(micCh);
     if (ttlHigh) {
       if (a0 < ttlThreshold - TTL_HYST) ttlHigh = false;
     } else if (a0 > ttlThreshold + TTL_HYST) {
@@ -167,7 +227,7 @@ void loop() {
     seq++;
   } else if (!streaming) {
     // keep the IR LED working (and the TTL state fresh) when not streaming
-    int a0 = analogRead(TTL_PIN);
+    int a0 = analogRead(ANALOG_PINS[ttlCh]);
     if (ttlHigh) {
       if (a0 < ttlThreshold - TTL_HYST) ttlHigh = false;
     } else if (a0 > ttlThreshold + TTL_HYST) {

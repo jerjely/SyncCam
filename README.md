@@ -37,7 +37,11 @@ The installers are not code-signed:
 
 Upload `firmware/SyncCam_Arduino/SyncCam_Arduino.ino` once with the Arduino IDE (Arduino Uno or Nano).
 
-| Arduino pin | Connect to |
+These are the default pins. You can pick other pins in the app (**Arduino → Pins**:
+TTL and microphone on any of A0–A7, IR LED on D2–D13). The choice is sent to the board each
+time you connect, so you never need to re-upload the sketch. A6 and A7 exist only on the Nano.
+
+| Arduino pin (default) | Connect to |
 |---|---|
 | A0 | TTL sync signal (the same TTL that goes to the Neuropixels), 0–5 V |
 | A1 | Microphone module output (MAX4466, MAX9814 or similar, biased at about 2.5 V) |
@@ -51,7 +55,7 @@ reported. Commands are documented at the top of the sketch.
 ## Using it
 
 1. **Camera:** pick the camera (**Scan** finds connected ones), size and frame rate, then **Open camera**.
-2. **Arduino:** pick the port and **Connect**. The board restarts when the port opens, which takes about 2 s.
+2. **Arduino:** pick the port, check the pins match your wiring, and **Connect**. The board restarts when the port opens, which takes about 2 s.
    Set the TTL threshold (default 2.5 V). The red dashed line in the TTL plot shows it.
 3. **IR LED:** click the button to switch it on or off. It stays as you set it, and SyncCam remembers
    the setting next time you connect.
@@ -98,7 +102,7 @@ TTL switches.
 
 ## Limits
 
-- Arduino Uno/Nano ADC: 10-bit. The microphone channel works for detecting sounds and cues,
+- Arduino ADC: 10-bit (Uno, Nano, Nano Every, Uno R4 all work; ESP32 boards are not supported). The microphone channel works for detecting sounds and cues,
   but it is not a measurement microphone. At 5 kHz it records up to 2.5 kHz.
 - Frame timing depends on the camera and its USB driver. Check `measured_fps` and the
   dropped-frame counts in `session.json`.
