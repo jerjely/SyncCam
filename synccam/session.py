@@ -65,6 +65,7 @@ class Recording:
         self.video_fps = 0.0
         # analog
         self.idx0: Optional[int] = None
+        self.idx_stop: Optional[int] = None     # last sample to keep (set by stop())
         self.next_idx: Optional[int] = None
         self.n_samples = 0
         self.filled = 0
@@ -122,6 +123,8 @@ class Recording:
             if self._wav is None:
                 return
             keep = idx >= self.idx0
+            if self.idx_stop is not None:
+                keep &= idx <= self.idx_stop
             if not keep.any():
                 return
             idx, vals = idx[keep], vals[keep]
@@ -174,7 +177,17 @@ class Recording:
         if self.camera is not None:
             self.camera.on_frame = None
         if self.stream is not None:
-            time.sleep(0.05)       # let the last chunk arrive
+            # keep samples up to the Stop moment, exactly like the start is cut at Record
+            off, per = self.clock.solve() if self.clock.pairs else self.stream.clock.solve()
+            with self._lock:
+                self.idx_stop = max(self.idx0 - 1, int(np.floor((self.t_stop - off) / per)))
+            deadline = time.perf_counter() + 1.0          # wait for those samples to arrive
+            while time.perf_counter() < deadline:
+                with self._lock:
+                    done = self.next_idx is not None and self.next_idx > self.idx_stop
+                if done or self.stream.error:
+                    break
+                time.sleep(0.005)
             self.stream.remove_sink(self._on_samples)
         if self.writer is not None:
             self.writer.close()

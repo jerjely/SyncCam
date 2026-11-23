@@ -216,7 +216,13 @@ def t_recording(ctx):
         assert w.getnchannels() == 3 and w.getframerate() == 5000
         ns = w.getnframes()
         raw = np.frombuffer(w.readframes(ns), dtype="<i2").reshape(-1, 3)
-    assert abs(ns - 15000) < 900, f"{ns} samples in 3 s at 5 kHz"
+    dur = js["duration_s"]
+    want = dur * js["arduino"]["measured_rate_hz"]
+    assert abs(ns - want) <= 0.01 * want + 60, f"{ns} samples in a {dur:.3f} s recording (expected about {want:.0f})"
+    assert ns == js["arduino"]["samples"]
+    # the Arduino data ends at Stop, together with the video
+    last = js["arduino"]["first_sample_time_s"] + (ns - 1) / js["arduino"]["measured_rate_hz"]
+    assert abs(last - dur) < 0.03, f"Arduino data ends at {last:.3f} s, recording at {dur:.3f} s"
     assert raw[:, 0].max() > 900 and raw[:, 2].min() == 1, "TTL missing or IR LED not on"
     assert js["arduino"]["samples_lost_and_filled"] == 0, f"{js['arduino']['samples_lost_and_filled']} samples lost"
     ttl = [r for r in _read_csv(folder / "ttl_events.csv") if r["edge"] == "rise"]
