@@ -43,7 +43,8 @@ def safe_name(text: str) -> str:
 class Recording:
     def __init__(self, out_dir: str, name: str, camera: Optional[CameraThread],
                  stream: Optional[ArduinoStream], codec: str = "MJPG",
-                 ttl_threshold: int = 512, extra: Optional[dict] = None, adjust_video: bool = True):
+                 ttl_threshold: int = 512, extra: Optional[dict] = None, adjust_video: bool = True,
+                 scale: Optional[dict] = None):
         if camera is None and stream is None:
             raise ValueError("Nothing to record: open a camera or connect the Arduino.")
         self.started_wall = datetime.now().astimezone()
@@ -54,6 +55,7 @@ class Recording:
         self.ttl_threshold = int(ttl_threshold)
         self.extra = extra or {}
         self.adjust_video = adjust_video
+        self.scale = scale                  # {"px_per_mm", "size", "set", "method"} or None
         self.image_changed = False
         self.t0 = 0.0
         self.t_stop: Optional[float] = None
@@ -61,6 +63,10 @@ class Recording:
         # video
         self.writer: Optional[VideoWriterThread] = None
         self.frame_t: List[float] = []
+        self.pupil_rows: List[tuple] = []      # per saved frame, when pupil tracking is on
+        self.track_pupil = False
+        self.pupil_params_at_start: Optional[dict] = None
+        self.pupil_changed = False
         self.frames_seen = 0
         self.video_fps = 0.0
         # analog
@@ -91,6 +97,10 @@ class Recording:
             grey = self.adjust_video and self.image_at_start.grey
             self.writer = VideoWriterThread(str(self.folder / f"video{ext}"), self.video_fps,
                                             self.camera.frame_size, self.codec, grey=grey)
+            tr = self.camera.pupil_tracker
+            self.track_pupil = tr is not None and tr.params.box is not None
+            if self.track_pupil:
+                self.pupil_params_at_start = tr.params.as_dict()
             self.camera.on_frame = self._on_frame
         if self.stream is not None:
             fs = self.stream.fs
@@ -117,6 +127,10 @@ class Recording:
         img = f.image if (self.adjust_video or f.raw is None) else f.raw
         if self.writer.put(img):
             self.frame_t.append(f.t)
+            if self.track_pupil:
+                pr = f.pupil
+                self.pupil_rows.append((pr.found, pr.x, pr.y, pr.diameter, pr.quality) if pr is not None
+                                       else (False, float("nan"), float("nan"), float("nan"), 0.0))
 
     def _on_samples(self, idx: np.ndarray, vals: np.ndarray, t: float) -> None:
         with self._lock:
@@ -238,6 +252,9 @@ class Recording:
         if self.camera is not None:
             n = len(ft)
             dur = ft[-1] - ft[0] if n > 1 else 0.0
+            if self.scale:
+                info["scale"] = {**self.scale, "note": "mm = pixels / px_per_mm (measured with a ruler "
+                                                        "at the eye's distance from the camera)"}
             info["video"] = {
                 "file": Path(self.writer.path).name,
                 "camera": self.camera.name,
@@ -262,11 +279,38 @@ class Recording:
                 est = None
             with open(self.folder / "frames.csv", "w", newline="", encoding="utf-8") as fh:
                 w = csv.writer(fh)
-                w.writerow(["frame", "time_s", "wall_time", "arduino_sample"])
+                head = ["frame", "time_s", "wall_time", "arduino_sample"]
+                pup = self.track_pupil and len(self.pupil_rows) >= n
+                k = self.scale["px_per_mm"] if self.scale else None
+                if pup:
+                    head += ["pupil_found", "pupil_x", "pupil_y", "pupil_diameter", "pupil_quality"]
+                    if k:
+                        head += ["pupil_x_mm", "pupil_y_mm", "pupil_diameter_mm"]
+                w.writerow(head)
                 for i in range(n):
-                    w.writerow([i, f"{ft[i]:.6f}",
-                                (wall0 + timedelta(seconds=float(ft[i]))).isoformat(timespec="milliseconds"),
-                                "" if est is None else int(est[i])])
+                    row = [i, f"{ft[i]:.6f}",
+                           (wall0 + timedelta(seconds=float(ft[i]))).isoformat(timespec="milliseconds"),
+                           "" if est is None else int(est[i])]
+                    if pup:
+                        ok, x, y, d, q = self.pupil_rows[i]
+                        row += [int(bool(ok))] + (["", "", ""] if not ok else
+                                                  [f"{x:.2f}", f"{y:.2f}", f"{d:.2f}"]) + [f"{q:.2f}"]
+                        if k:
+                            row += ["", "", ""] if not ok else [f"{x / k:.4f}", f"{y / k:.4f}", f"{d / k:.4f}"]
+                    w.writerow(row)
+            if pup:
+                found = np.array([r[0] for r in self.pupil_rows[:n]], bool)
+                diam = np.array([r[3] for r in self.pupil_rows[:n]], float)[found]
+                info["pupil"] = {
+                    "tracked": True, **(self.pupil_params_at_start or {}),
+                    "settings_changed_during_recording": self.pupil_changed,
+                    "found_in_percent_of_frames": round(100.0 * found.mean(), 1) if n else 0.0,
+                    "diameter_px_median": round(float(np.median(diam)), 2) if len(diam) else None,
+                    "diameter_mm_median": (round(float(np.median(diam)) / k, 4)
+                                           if (k and len(diam)) else None),
+                    "units": "image pixels; pupil_diameter = long axis of the fitted ellipse",
+                    "columns": "frames.csv: pupil_found, pupil_x, pupil_y, pupil_diameter, pupil_quality",
+                }
         # TTL events, each with the video frame at that moment
         if fit is not None:
             r = np.concatenate(self.ttl_rises) if self.ttl_rises else np.zeros(0, np.int64)

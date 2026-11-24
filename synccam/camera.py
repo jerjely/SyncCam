@@ -6,6 +6,7 @@ go through a queue to a VideoWriterThread so a slow disk never stalls capture.
 """
 from __future__ import annotations
 
+import math
 import queue
 import sys
 import threading
@@ -67,6 +68,56 @@ class TestPatternSource:
     `led_fn` returns the current LED state; the spot at LED_RECT is bright when on.
     """
     LED_RECT = (40, 40, 40, 40)      # x, y, w, h
+    RULER_PX_PER_MM = 10.0           # the test ruler: one mark per mm
+    RULER_ORIGIN = (40, 420)         # x, y of its 0 mm mark
+    BLINK_EVERY = 150                # frames: a synthetic blink lasting BLINK_LEN frames
+    BLINK_LEN = 4
+
+    def eye_box(self):
+        """Box around the synthetic eye, for pupil tracking on the test pattern."""
+        cx, cy = int(self.w * 0.62), int(self.h * 0.45)
+        return (cx - 75, cy - 45, 150, 90)
+
+    def eye_truth(self, n: int):
+        """(x, y, diameter, open) of the synthetic pupil in frame n."""
+        cx, cy = self.w * 0.62, self.h * 0.45
+        t = n / 30.0
+        x = cx + 12 * math.sin(2 * math.pi * 0.31 * t)
+        y = cy + 5 * math.sin(2 * math.pi * 0.47 * t + 1.0)
+        d = 30 + 10 * math.sin(2 * math.pi * 0.11 * t)
+        blink = (n % self.BLINK_EVERY) < self.BLINK_LEN and n >= self.BLINK_EVERY
+        return x, y, d, not blink
+
+    def _draw_ruler(self, img: np.ndarray) -> None:
+        cv2 = _cv2()
+        x0, y0 = self.RULER_ORIGIN
+        k = self.RULER_PX_PER_MM
+        cv2.rectangle(img, (x0 - 8, y0 - 28), (x0 + int(30 * k) + 8, y0 + 6), (225, 225, 225), -1)
+        for mm in range(31):
+            x = int(round(x0 + mm * k))
+            h = 20 if mm % 10 == 0 else (14 if mm % 5 == 0 else 8)
+            cv2.line(img, (x, y0), (x, y0 - h), (25, 25, 25), 1)
+        for mm in (0, 10, 20, 30):
+            cv2.putText(img, str(mm), (int(x0 + mm * k) + 2, y0 - 16), cv2.FONT_HERSHEY_PLAIN, 0.7, (25, 25, 25), 1)
+
+    def _draw_eye(self, img: np.ndarray, n: int) -> None:
+        cv2 = _cv2()
+        cx, cy = int(self.w * 0.62), int(self.h * 0.45)
+        x, y, d, is_open = self.eye_truth(n)
+        cv2.ellipse(img, (cx, cy), (68, 38), 0, 0, 360, (135, 135, 135), -1)     # skin around
+        if not is_open:
+            cv2.ellipse(img, (cx, cy), (60, 6), 0, 0, 360, (70, 70, 70), -1)     # closed lid
+            return
+        eye = np.zeros(img.shape[:2], np.uint8)
+        cv2.ellipse(eye, (cx, cy), (60, 32), 0, 0, 360, 255, -1)                   # eye opening
+        iris = np.full_like(img, 95)
+        cv2.circle(iris, (int(round(x)), int(round(y))), 34, (80, 80, 80), -1)   # iris, darker ring
+        sub = 8                                                                   # pupil drawn at 1/8 px
+        cv2.circle(iris, (int(round(x * sub)), int(round(y * sub))), int(round(d / 2 * sub)), (22, 22, 22), -1,
+                   lineType=cv2.LINE_AA, shift=3)
+        cv2.circle(iris, (int(x - d * 0.2), int(y - d * 0.2)), 2, (230, 230, 230), -1)   # small reflection
+        img[eye > 0] = iris[eye > 0]
+        cv2.ellipse(img, (cx, cy), (60, 32), 0, 200, 340, (215, 215, 215), 2)    # bright upper lid rim
 
     def __init__(self, size=(640, 480), fps: float = 30.0, led_fn: Optional[Callable[[], bool]] = None):
         self.w, self.h = size
@@ -76,6 +127,7 @@ class TestPatternSource:
         self._next = time.perf_counter()
         yy, xx = np.mgrid[0:self.h, 0:self.w]
         self._bg = ((xx * 60 // max(1, self.w)) + (yy * 40 // max(1, self.h)) + 30).astype(np.uint8)
+        self._rng = np.random.default_rng(0)
 
     def isOpened(self) -> bool:
         return True
@@ -90,6 +142,10 @@ class TestPatternSource:
         img[:, max(0, x - 6):x + 6] = (90, 160, 90)
         x0, y0, w, h = self.LED_RECT
         img[y0:y0 + h, x0:x0 + w] = 250 if self.led_fn() else 20
+        self._draw_eye(img, self._n)
+        self._draw_ruler(img)
+        noise = self._rng.integers(-6, 7, img.shape[:2], dtype=np.int16)
+        img = np.clip(img.astype(np.int16) + noise[:, :, None], 0, 255).astype(np.uint8)
         try:
             cv2 = _cv2()
             cv2.putText(img, f"TEST {self._n:06d}", (self.w - 230, self.h - 20),
@@ -157,6 +213,7 @@ class Frame:
     n: int                  # frame number since the camera was opened
     roi_mean: float         # mean brightness in the LED ROI (nan if none)
     raw: Optional[np.ndarray] = None   # untouched camera image (BGR)
+    pupil: Optional[object] = None     # PupilResult when pupil tracking is on
 
 
 class CameraThread:
@@ -176,6 +233,9 @@ class CameraThread:
         self.on_frame: Optional[Callable[[Frame], None]] = None  # called in the capture thread
         self._settings = ImageSettings()
         self._lut = self._settings.lut()
+        self.pupil_tracker = None          # synccam.pupil.PupilTracker, set by the GUI
+        self.pupil_want_mask = False       # keep the dark-pixel mask for display (while tuning)
+        self.pupil_log: deque = deque(maxlen=30 * 120)   # (t, found, x, y, diameter): last ~2 min
         self._times: deque = deque(maxlen=120)
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -259,7 +319,16 @@ class CameraThread:
                     continue
                 fails = 0
                 settings, lut = self._settings, self._lut
-                frame = Frame(process_image(img, settings, lut), t, n, self._roi_mean(img), img)
+                pr = None
+                tracker = self.pupil_tracker
+                if tracker is not None and tracker.params.box is not None:
+                    try:
+                        pr = tracker.detect(img, keep_mask=self.pupil_want_mask)
+                    except Exception:            # never let tracking stop the camera
+                        pr = None
+                    if pr is not None:
+                        self.pupil_log.append((t, pr.found, pr.x, pr.y, pr.diameter))
+                frame = Frame(process_image(img, settings, lut), t, n, self._roi_mean(img), img, pr)
                 n += 1
                 self._times.append(t)
                 self.latest = frame

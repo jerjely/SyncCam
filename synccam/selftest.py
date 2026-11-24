@@ -10,6 +10,7 @@ from __future__ import annotations
 import csv
 import faulthandler
 import json
+import math
 import os
 import sys
 import tempfile
@@ -127,6 +128,36 @@ def t_firmware(ctx):
     ctx.log(f"    firmware {len(img)} bytes, uploads at 115200 and 57600 baud")
 
 
+def t_pupil(ctx):
+    """Pupil detection on the synthetic eye: accuracy against the true values, blinks rejected."""
+    from .camera import TestPatternSource
+    from .pupil import PupilParams, PupilTracker
+    src = TestPatternSource((640, 480), 10000)
+    tr = PupilTracker(PupilParams(box=src.eye_box()))
+    err_xy, err_d, opens, found, blinks, rejected = [], [], 0, 0, 0, 0
+    t0 = time.perf_counter()
+    for n in range(450):
+        _ok, img = src.read()
+        r = tr.detect(img)
+        x, y, d, is_open = src.eye_truth(n)
+        if is_open:
+            opens += 1
+            if r.found:
+                found += 1
+                err_xy.append(math.hypot(r.x - x, r.y - y))
+                err_d.append(abs(r.diameter - d))
+        else:
+            blinks += 1
+            rejected += not r.found
+    ms = (time.perf_counter() - t0) / 450 * 1000
+    assert found >= 0.98 * opens, f"pupil found in only {found} of {opens} open-eye frames"
+    assert blinks and rejected == blinks, f"{blinks - rejected} of {blinks} blink frames gave a pupil"
+    assert max(err_xy) < 1.5 and np.mean(err_xy) < 0.4, f"centre error mean {np.mean(err_xy):.2f}, max {max(err_xy):.2f} px"
+    assert max(err_d) < 3.0 and np.mean(err_d) < 1.5, f"diameter error mean {np.mean(err_d):.2f}, max {max(err_d):.2f} px"
+    ctx.log(f"    centre error {np.mean(err_xy):.2f} px, diameter error {np.mean(err_d):.2f} px, "
+            f"{rejected}/{blinks} blink frames rejected, {ms:.1f} ms per frame (incl. drawing)")
+
+
 def t_packets(ctx):
     from .arduino import PacketParser, SeqUnwrapper, encode_packet
     pk = b"".join(encode_packet(i, (7 * i) % 1024, (13 * i) % 1024, i % 2, i % 3 == 0) for i in range(700))
@@ -203,8 +234,10 @@ def t_recording(ctx):
     sim = SimulatedArduino()
     st = ArduinoStream(sim, 5000)
     st.connect(IR_ON)
-    cam = CameraThread(TEST_PATTERN, (320, 240), 30, sim.current_led)
+    from .pupil import PupilParams, PupilTracker
+    cam = CameraThread(TEST_PATTERN, (640, 480), 30, sim.current_led)
     cam.open()
+    cam.pupil_tracker = PupilTracker(PupilParams(box=cam.cap.eye_box()))
     time.sleep(0.5)
     rec = Recording(str(ctx.tmp), "selftest", cam, st, "MJPG", 512, {"name": "selftest"})
     rec.start()
@@ -230,6 +263,13 @@ def t_recording(ctx):
     assert ok and (first.ndim == 2 or (np.abs(first[..., 0].astype(int) - first[..., 2]).max() <= 2)), \
         "the default recording should be greyscale"
     assert js["video"]["image_adjustments"]["greyscale"] is True
+    # pupil columns, one value per video frame
+    assert "pupil_diameter" in frames[0], list(frames[0].keys())
+    ok = [r for r in frames if r["pupil_found"] == "1"]
+    assert len(ok) >= 0.9 * len(frames), f"pupil found in {len(ok)} of {len(frames)} frames"
+    dia = [float(r["pupil_diameter"]) for r in ok]
+    assert 18 < min(dia) and max(dia) < 42, (min(dia), max(dia))
+    assert js["pupil"]["found_in_percent_of_frames"] >= 90, js["pupil"]
     with wave.open(str(folder / "analog.wav")) as w:
         assert w.getnchannels() == 3 and w.getframerate() == 5000
         ns = w.getnframes()
@@ -332,6 +372,47 @@ def t_gui(ctx):
     _pump(app, lambda: win.camera.latest.image.ndim == 3, 2, "colour preview")
     win.grey_chk.setChecked(True)
     _pump(app, lambda: win.camera.latest.image.ndim == 2, 2, "greyscale preview")
+    # calibration: record a clip, scrub, measure the test ruler (10 px per mm)
+    from PySide6.QtCore import QPointF
+    from .camera import TestPatternSource
+    from .gui import CalibrationDialog
+    assert "not set" in win.scale_label.text()
+    dlg = CalibrationDialog(win.camera, None, win)
+    dlg.show()
+    dlg._toggle_record()
+    t_end = time.time() + 1.2
+    _pump(app, lambda: time.time() > t_end, 5, "calibration clip")
+    dlg._toggle_record()
+    assert len(dlg.clip) >= 20 and dlg.scrub.isEnabled(), f"{len(dlg.clip)} frames in the clip"
+    dlg._step(1, False)
+    dlg._step(1, True)
+    assert dlg.frame_index == dlg.scrub.value() and "frame" in dlg.frame_label.text()
+    x0, y0 = TestPatternSource.RULER_ORIGIN
+    k_true = TestPatternSource.RULER_PX_PER_MM
+    dlg.canvas.points = [QPointF(x0, y0 - 5), QPointF(x0 + 25 * k_true, y0 - 5)]
+    dlg.mm_spin.setValue(25.0)
+    dlg._update()
+    app.processEvents()
+    dlg.grab()                                   # paints the frame, line and points
+    assert abs(dlg.px_per_mm() - k_true) < 1e-6 and "calibration clip" in dlg.method(), (dlg.px_per_mm(), dlg.method())
+    assert win.apply_calibration(dlg)
+    dlg.done(0)
+    assert win.scale["px_per_mm"] == k_true and "10.00 px/mm" in win.scale_label.text(), win.scale_label.text()
+    assert win.pupil_plot.px_per_mm == k_true
+
+    # pupil tracking on the test pattern's synthetic eye
+    assert not win.pupil_box.isVisible()
+    win.pupil_chk.setChecked(True)
+    win.view.eye_box = win.camera.cap.eye_box()
+    win._eye_box_drawn(win.view.eye_box)
+    _pump(app, lambda: sum(1 for r in win.camera.pupil_log if r[1]) > 15, 5, "pupil found")
+    assert win.pupil_box.isVisible() and win.view.pupil is not None and win.view.pupil.found
+    app.processEvents()
+    win.grab()                                   # paints outline, close-up and plots
+    win.pupil_show_chk.setChecked(False)
+    assert not win.pupil_box.isVisible() and win.camera.pupil_tracker is not None, \
+        "hiding the pupil view must not stop tracking"
+    win.pupil_show_chk.setChecked(True)
     win.window_combo.setCurrentIndex(win.window_combo.findData(0.1))
     win.mic_combo.setCurrentIndex(win.mic_combo.findData(64))
     assert win.scope.window_s == 0.1 and win.scope.mic_scale == 64
@@ -361,6 +442,13 @@ def t_gui(ctx):
     assert js["video"]["frames"] > 40 and js["arduino"]["samples"] > 10000, js
     assert js["ir_led_at_start"] == "on"
     assert js["arduino"]["pins"] == {"ttl": "A5", "microphone": "A1", "ir_led": "D8"}, js["arduino"]["pins"]
+    assert js.get("pupil", {}).get("found_in_percent_of_frames", 0) >= 80, js.get("pupil")
+    assert js["scale"]["px_per_mm"] == 10.0 and js["scale"]["size"] == [640, 480], js.get("scale")
+    with open(win.last_folder / "frames.csv", newline="", encoding="utf-8") as fh:
+        rows = [r for r in csv.DictReader(fh) if r["pupil_found"] == "1"]
+    r0 = rows[len(rows) // 2]
+    assert abs(float(r0["pupil_diameter_mm"]) - float(r0["pupil_diameter"]) / 10.0) < 1e-3, r0
+    assert 1.5 < float(r0["pupil_diameter_mm"]) < 4.5, r0      # synthetic pupil: 20-40 px = 2-4 mm
     # short screen (small laptop / Windows scaling): nothing squashed, Record still visible
     win.resize(1100, 560)
     t_end = time.time() + 0.3
@@ -378,6 +466,7 @@ TESTS = [
     ("video codecs", t_video_codecs),
     ("picture adjustments", t_image),
     ("Arduino firmware and uploader", t_firmware),
+    ("pupil detection", t_pupil),
     ("serial packets", t_packets),
     ("TTL edges and clock fit", t_edges_and_clock),
     ("simulated Arduino stream", t_simulated_stream),

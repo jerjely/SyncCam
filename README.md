@@ -76,7 +76,20 @@ reported. Commands are documented at the top of the sketch.
    to record the camera's original image and use the adjustments only for viewing.
 5. **Signals:** choose how much to show (50 ms to 10 s) and the microphone scale, or use the mouse
    wheel over the plot (Shift + wheel for the microphone). **Freeze** holds the plot so you can look closely.
-6. **Recording:** choose a folder and a name, then **Record** and **Stop recording**.
+6. **Pupil (optional):** tick **Track pupil**, then drag a box around the eye in the camera picture.
+   Leave some room around the eye so a fully dilated pupil still fits. SyncCam finds the pupil in
+   every frame and shows its outline, an enlarged close-up of the eye, an x–y trail and live traces of
+   horizontal position, vertical position and diameter. **Show pupil view** hides all of that, while
+   tracking and saving carry on. If the outline is too small or spills over the iris, move the
+   **Threshold** slider (the pixels counted as pupil show in red while you move it).
+7. **Calibration (optional, for millimetres):** with the camera open, click **Calibrate...** next to
+   *Scale*. Hold a ruler in front of the eye, at the eye's distance from the camera, click **Record clip**,
+   then **Stop**. Scrub with the slider (or the arrow keys; Shift+arrow jumps 10 frames) to a frame where
+   the ruler is sharp, click both ends of a known distance (zoom with the mouse wheel and drag the points to
+   fine-tune), type the distance in mm and click OK. You can also type a known scale directly. The scale is
+   remembered, together with the picture size it was measured at: after a resolution change SyncCam asks
+   you to calibrate again rather than giving wrong millimetres.
+8. **Recording:** choose a folder and a name, then **Record** and **Stop recording**.
 
 **Simulator (no hardware)** and **Test pattern (no camera)** let you try everything without hardware.
 
@@ -87,11 +100,11 @@ Each recording goes into its own folder, `<name>_<date>_<time>/`:
 | File | Contents |
 |---|---|
 | `video.avi` (or `.mp4`) | The camera video |
-| `frames.csv` | For every frame: `time_s`, wall clock, and the matching Arduino `sample` |
+| `frames.csv` | For every frame: `time_s`, wall clock, the matching Arduino `sample`, and with pupil tracking on `pupil_found`, `pupil_x`, `pupil_y`, `pupil_diameter`, `pupil_quality` (pixels), plus `pupil_x_mm`, `pupil_y_mm`, `pupil_diameter_mm` when a calibration is set |
 | `ttl_events.csv` | Every TTL rising and falling edge: `sample`, `time_s`, `video_frame`, `frame_time_s` |
 | `microphone.wav` | The microphone, centred and amplified so you can listen to it |
 | `analog.wav` | 3 channels at the sample rate, raw values: TTL (0–1023), microphone (0–1023), IR LED (0/1) |
-| `session.json` | Settings (including pins and picture adjustments), measured frame rate, Arduino clock fit, drop counts |
+| `session.json` | Settings (including pins, picture adjustments and the calibration with how and when it was measured), measured frame rate, Arduino clock fit, drop counts |
 
 All `time_s` values are seconds since **Record** was pressed, on the computer's clock.
 Arduino sample *n* happened at `first_sample_time_s + n / measured_rate_hz` (both in `session.json`).
@@ -116,6 +129,18 @@ Frame times are when each frame reached the computer, which is a little after it
 (typically one or two frame intervals for USB cameras). If you need alignment to better than a
 frame or two, measure this delay once for your camera, for example by filming an LED that the
 TTL switches.
+
+### Pupil tracking
+
+The pupil is found by contrast: inside the eye box SyncCam looks for the darkest round blob, tries a
+range of thresholds and keeps the one where the blob's outline is most stable (the pupil's sharp edge),
+then fits an ellipse to its convex outline. This handles small and fully dilated pupils, the lower lid
+cutting into the pupil, and small reflections. `pupil_diameter` is the long axis of the ellipse in image
+pixels; `pupil_x` / `pupil_y` are the centre in image pixels. Blinks and frames where the pupil cannot be
+seen give `pupil_found = 0` and empty values, never a guess. `pupil_quality` (0–1) combines roundness and
+contrast; frames below 0.2 are already rejected. Detection takes 1–2 ms per frame, so it does not slow
+the camera down. It works on the original camera image, so the brightness/contrast sliders do not
+change the measurement.
 
 ## Limits
 

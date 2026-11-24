@@ -12,7 +12,8 @@ from PySide6 import QtCore
 from PySide6.QtCore import QPointF, QRectF, QSettings, Qt, QTimer, QUrl
 from PySide6.QtGui import (QAction, QColor, QDesktopServices, QIcon, QImage, QKeySequence,
                            QPainter, QPalette, QPen, QPixmap, QPolygonF)
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+                               QDoubleSpinBox, QFileDialog,
                                QFormLayout, QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
                                QMainWindow, QMessageBox, QProgressDialog, QPushButton, QScrollArea,
                                QSizePolicy, QSlider, QSpinBox, QVBoxLayout, QWidget)
@@ -23,6 +24,7 @@ from .arduino import (ANALOG_PINS, DEFAULT_PINS, IR_OFF, IR_ON, IR_PINS, SAMPLE_
                       ArduinoStream, SimulatedArduino, list_serial_ports, make_arduino)
 from .camera import (CODECS, RESOLUTIONS, TEST_PATTERN, CameraThread, ImageSettings, auto_levels,
                      scan_cameras)
+from .pupil import PupilParams, PupilTracker
 from .session import Recording
 
 APP_ID = "io.github.jerjely.SyncCam"
@@ -98,7 +100,7 @@ def hint(text: str) -> QLabel:
 
 # --------------------------------------------------------------------------
 class VideoView(QWidget):
-    """Live camera picture."""
+    """Live camera picture. With pupil tracking on, drag a box around the eye."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -109,6 +111,13 @@ class VideoView(QWidget):
         self.recording = False
         self.message = "No camera open"
         self.overlay = ""
+        self.drawing_enabled = False       # pupil tracking on: dragging draws the eye box
+        self.show_pupil = True             # draw the box / ellipse
+        self.eye_box = None                # x, y, w, h in image pixels
+        self.on_eye_box = None             # callback(box)
+        self.pupil = None                  # latest PupilResult
+        self.mask = None                   # dark-pixel mask of the box (shown while tuning)
+        self._drag = None
 
     def set_frame(self, arr: Optional[np.ndarray]) -> None:
         if arr is None:
@@ -129,6 +138,42 @@ class VideoView(QWidget):
         w, h = iw * s, ih * s
         return QRectF((self.width() - w) / 2, (self.height() - h) / 2, w, h)
 
+    def _to_img(self, pos) -> Optional[QPointF]:
+        r = self._target()
+        if r is None:
+            return None
+        s = r.width() / self._img.width()
+        x = min(max((pos.x() - r.left()) / s, 0), self._img.width() - 1)
+        y = min(max((pos.y() - r.top()) / s, 0), self._img.height() - 1)
+        return QPointF(x, y)
+
+    def mousePressEvent(self, e):
+        if not self.drawing_enabled or e.button() != Qt.MouseButton.LeftButton:
+            return
+        p = self._to_img(e.position())
+        if p is not None:
+            self._drag = (p, p)
+            self.update()
+
+    def mouseMoveEvent(self, e):
+        if self._drag:
+            p = self._to_img(e.position())
+            if p is not None:
+                self._drag = (self._drag[0], p)
+                self.update()
+
+    def mouseReleaseEvent(self, e):
+        if self._drag:
+            a, b = self._drag
+            self._drag = None
+            x0, y0 = int(min(a.x(), b.x())), int(min(a.y(), b.y()))
+            w, h = int(abs(a.x() - b.x())), int(abs(a.y() - b.y()))
+            if w >= 12 and h >= 12:
+                self.eye_box = (x0, y0, w, h)
+                if self.on_eye_box:
+                    self.on_eye_box(self.eye_box)
+            self.update()
+
     def paintEvent(self, _e):
         p = QPainter(self)
         p.fillRect(self.rect(), QColor("#0b1226"))
@@ -140,6 +185,46 @@ class VideoView(QWidget):
             return
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         p.drawImage(r, self._img)
+        s = r.width() / self._img.width()
+
+        def to_view(x, y):
+            return QPointF(r.left() + x * s, r.top() + y * s)
+
+        if self.drawing_enabled and self.show_pupil:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            if self.eye_box:
+                bx, by, bw, bh = self.eye_box
+                if self.mask is not None and self.mask.shape[0] <= bh and self.mask.shape[1] <= bw:
+                    m = np.ascontiguousarray(self.mask)
+                    tint = np.zeros((m.shape[0], m.shape[1], 4), np.uint8)
+                    tint[m > 0] = (60, 60, 255, 110)          # BGRA: red, see-through
+                    qi = QImage(tint.data, m.shape[1], m.shape[0], tint.strides[0], QImage.Format.Format_ARGB32)
+                    p.drawImage(QRectF(to_view(bx, by), to_view(bx + m.shape[1], by + m.shape[0])), qi)
+                p.setPen(QPen(QColor("#ffd23f"), 1, Qt.PenStyle.DashLine))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawRect(QRectF(to_view(bx, by), to_view(bx + bw, by + bh)))
+            pr = self.pupil
+            if pr is not None and pr.found:
+                c = to_view(pr.x, pr.y)
+                p.save()
+                p.translate(c)
+                p.rotate(pr.angle)
+                p.setPen(QPen(QColor("#2ee59d"), 1.6))
+                p.drawEllipse(QPointF(0, 0), pr.minor / 2 * s, pr.diameter / 2 * s)
+                p.restore()
+                p.setPen(QPen(QColor("#ff4d6a"), 1.4))
+                p.drawLine(c + QPointF(-4, 0), c + QPointF(4, 0))
+                p.drawLine(c + QPointF(0, -4), c + QPointF(0, 4))
+            if not self.eye_box:
+                p.setPen(QColor("#ffd23f"))
+                p.drawText(r.adjusted(10, 8, -10, 0), int(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft),
+                           "Drag a box around the eye to start pupil tracking")
+        if self._drag:
+            a, b = self._drag
+            p.setPen(QPen(QColor("#ffd23f"), 1, Qt.PenStyle.DashLine))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawRect(QRectF(to_view(min(a.x(), b.x()), min(a.y(), b.y())),
+                              to_view(max(a.x(), b.x()), max(a.y(), b.y()))))
         if self.recording:
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor("#e0334d"))
@@ -154,6 +239,170 @@ class VideoView(QWidget):
             p.setPen(QColor("#ffffff"))
             p.drawText(r.adjusted(0, 0, -10, -8), int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom),
                        self.overlay)
+        p.end()
+
+
+# --------------------------------------------------------------------------
+class PupilPlot(QWidget):
+    """Live pupil view: x-y trail on the left, x / y / diameter traces on the right."""
+    WINDOWS = [5.0, 10.0, 30.0, 60.0, 120.0]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(120)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.data = np.zeros((0, 5))       # t, found, x, y, diameter
+        self.window_s = 10.0
+        self._close = None                 # (QImage, numpy buffer, box, PupilResult)
+        self.px_per_mm: Optional[float] = None   # set by the calibration: show mm instead of px
+        self.on_wheel = None
+        self.setToolTip("Mouse wheel: zoom time")
+
+    def sizeHint(self):
+        return QtCore.QSize(600, 160)
+
+    def set_data(self, rows) -> None:
+        self.data = np.asarray(rows, float).reshape(-1, 5) if len(rows) else np.zeros((0, 5))
+        self.update()
+
+    def set_closeup(self, img: Optional[np.ndarray], box, result) -> None:
+        """Enlarged view of the eye box with the fitted outline."""
+        if img is None or box is None:
+            self._close = None
+            return
+        x, y, w, h = box
+        crop = img[y:y + h, x:x + w]
+        if crop.ndim == 3:
+            crop = crop.mean(axis=2).astype(np.uint8)
+        crop = np.ascontiguousarray(crop)
+        if crop.size == 0:
+            self._close = None
+            return
+        qi = QImage(crop.data, crop.shape[1], crop.shape[0], crop.strides[0], QImage.Format.Format_Grayscale8)
+        self._close = (qi, crop, box, result)
+
+    def wheelEvent(self, e):
+        d = e.angleDelta().y()
+        if d and self.on_wheel:
+            self.on_wheel(-1 if d > 0 else 1)
+            e.accept()
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(QColor("#d6dbe8"), 1))
+        p.setBrush(QColor("#fbfcff"))
+        p.drawRoundedRect(QRectF(0.5, 0.5, self.width() - 1, self.height() - 1), 8, 8)
+        d = self.data
+        if len(d):
+            d = d[d[:, 0] >= d[-1, 0] - self.window_s]
+        ok = d[:, 1] > 0 if len(d) else np.zeros(0, bool)
+        H = self.height()
+        side = H - 16
+        x_left = 10
+        if self._close is not None:                     # eye close-up first
+            qi, _buf, (bx, by, bw, bh), pr = self._close
+            cw = min(side * bw / max(bh, 1), side * 2.2)
+            ch = cw * bh / max(bw, 1)
+            cr = QRectF(x_left, 8 + (side - ch) / 2, cw, ch)
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            p.drawImage(cr, qi)
+            if pr is not None and pr.found:
+                k = cw / bw
+                p.save()
+                p.translate(cr.left() + (pr.x - bx) * k, cr.top() + (pr.y - by) * k)
+                p.rotate(pr.angle)
+                p.setPen(QPen(QColor("#2ee59d"), 1.6))
+                p.setBrush(Qt.BrushStyle.NoBrush)
+                p.drawEllipse(QPointF(0, 0), pr.minor / 2 * k, pr.diameter / 2 * k)
+                p.restore()
+            elif pr is not None:
+                p.setPen(QColor("#ff4d6a"))
+                p.drawText(cr, int(Qt.AlignmentFlag.AlignCenter), "not found")
+            x_left = cr.right() + 10
+        sq = QRectF(x_left, 8, side, side)
+        p.setPen(QPen(QColor("#e6e9f3"), 1))
+        p.setBrush(QColor("#ffffff"))
+        p.drawRect(sq)
+        if not ok.any():
+            p.setPen(QColor("#8a93ad"))
+            p.drawText(QRectF(0, 0, self.width(), H), int(Qt.AlignmentFlag.AlignCenter),
+                       "No pupil yet" if len(d) else "Pupil tracking is starting...")
+            p.end()
+            return
+        x, y, dia, t = d[:, 2], d[:, 3], d[:, 4], d[:, 0]
+        # x-y trail, centred on the mean position, same scale on both axes
+        cx, cy = np.nanmean(x[ok]), np.nanmean(y[ok])
+        span = max(4.0, np.nanmax(np.abs(np.r_[x[ok] - cx, y[ok] - cy])) * 1.15)
+        def to_sq(xx, yy):
+            return QPointF(sq.center().x() + (xx - cx) / span * side / 2, sq.center().y() + (yy - cy) / span * side / 2)
+        p.setPen(QPen(QColor("#e6e9f3"), 1, Qt.PenStyle.DashLine))
+        p.drawLine(QPointF(sq.center().x(), sq.top()), QPointF(sq.center().x(), sq.bottom()))
+        p.drawLine(QPointF(sq.left(), sq.center().y()), QPointF(sq.right(), sq.center().y()))
+        idx = np.flatnonzero(ok)
+        n = len(idx)
+        for k in range(1, n):
+            i0, i1 = idx[k - 1], idx[k]
+            if i1 - i0 > 3:
+                continue
+            alpha = int(40 + 215 * k / n)
+            p.setPen(QPen(QColor(47, 70, 217, alpha), 1.2))
+            p.drawLine(to_sq(x[i0], y[i0]), to_sq(x[i1], y[i1]))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#ff4d6a"))
+        p.drawEllipse(to_sq(x[idx[-1]], y[idx[-1]]), 3.5, 3.5)
+        p.setPen(QColor("#8a93ad"))
+        k_mm = self.px_per_mm
+        p.drawText(QRectF(sq.left() + 3, sq.bottom() - 15, side, 14), int(Qt.AlignmentFlag.AlignLeft),
+                   f"\u00b1{span / k_mm:.2f} mm" if k_mm else f"\u00b1{span:.0f} px")
+        # traces
+        left = sq.right() + 92
+        right = self.width() - 10
+        width = max(10, right - left)
+        lanes = [("Horizontal (x)", x, "#2f46d9"), ("Vertical (y)", y, "#7a4cff"), ("Diameter", dia, "#2ee59d")]
+        lane_h = (H - 16) / 3
+        t1 = t[-1]
+        for k, (name, v, colour) in enumerate(lanes):
+            top = 8 + k * lane_h
+            vv = v[ok]
+            p.setPen(QColor("#5a6482"))
+            p.drawText(QRectF(sq.right() + 8, top, 84, lane_h / 2), int(Qt.AlignmentFlag.AlignVCenter), name)
+            p.setPen(QColor(colour))
+            p.drawText(QRectF(sq.right() + 8, top + lane_h / 2 - 2, 84, lane_h / 2),
+                       int(Qt.AlignmentFlag.AlignVCenter),
+                       f"{v[idx[-1]] / k_mm:.3f} mm" if k_mm else f"{v[idx[-1]]:.1f} px")
+            p.setPen(QPen(QColor("#e6e9f3"), 1))
+            p.drawLine(QPointF(left, top + lane_h - 2), QPointF(right, top + lane_h - 2))
+            lo_v, hi_v = np.nanmin(vv), np.nanmax(vv)
+            pad = max(1.0, (hi_v - lo_v) * 0.1)
+            lo_v, hi_v = lo_v - pad, hi_v + pad
+
+            def pt(tt, val):
+                return QPointF(right - (t1 - tt) / self.window_s * width,
+                               top + 3 + (1 - (val - lo_v) / (hi_v - lo_v)) * (lane_h - 8))
+
+            p.setPen(QPen(QColor(colour), 1.3))
+            seg = []
+            for i in range(len(t)):
+                if ok[i]:
+                    seg.append(pt(t[i], v[i]))
+                elif seg:
+                    p.drawPolyline(QPolygonF(seg)) if len(seg) > 1 else None
+                    seg = []
+            if len(seg) > 1:
+                p.drawPolyline(QPolygonF(seg))
+            # gaps (blinks, lost pupil) as a light band
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(QColor(214, 51, 74, 35))
+            miss = np.flatnonzero(~ok)
+            if len(miss):
+                runs = np.split(miss, np.flatnonzero(np.diff(miss) > 1) + 1)
+                for r_ in runs:
+                    xa, xb = pt(t[r_[0]], lo_v).x(), pt(t[r_[-1]], lo_v).x()
+                    p.drawRect(QRectF(xa, top + 2, max(1.5, xb - xa), lane_h - 6))
+        p.setPen(QColor("#8a93ad"))
+        p.drawText(QRectF(left, H - 16, width, 14), int(Qt.AlignmentFlag.AlignLeft), f"-{self.window_s:g} s")
+        p.drawText(QRectF(left, H - 16, width, 14), int(Qt.AlignmentFlag.AlignRight), "now")
         p.end()
 
 
@@ -280,11 +529,322 @@ class ScopeWidget(QWidget):
 
 
 # --------------------------------------------------------------------------
+class MeasureCanvas(QWidget):
+    """Still image where two points are clicked (and can be dragged); wheel zooms around the mouse."""
+
+    def __init__(self, img: np.ndarray, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(560, 380)
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.points = []                  # image coordinates (QPointF), at most 2
+        self.zoom = 1.0
+        self._drag = None
+        self.on_change = None
+        self.on_key = None                # arrow keys, for scrubbing
+        self.message = ""
+        self.set_image(img)
+        self.center = QPointF(self._img.width() / 2, self._img.height() / 2)   # image point in the middle
+
+    def set_image(self, img: np.ndarray) -> None:
+        arr = np.ascontiguousarray(img)
+        self._arr = arr
+        fmt = QImage.Format.Format_Grayscale8 if arr.ndim == 2 else QImage.Format.Format_BGR888
+        self._img = QImage(arr.data, arr.shape[1], arr.shape[0], arr.strides[0], fmt)
+        self.update()
+
+    def keyPressEvent(self, e):
+        if self.on_key and e.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right):
+            self.on_key(-1 if e.key() == Qt.Key.Key_Left else 1, bool(e.modifiers() & Qt.KeyboardModifier.ShiftModifier))
+        else:
+            super().keyPressEvent(e)
+
+    def _scale(self) -> float:
+        base = min(self.width() / self._img.width(), self.height() / self._img.height())
+        return base * self.zoom
+
+    def to_view(self, pt: QPointF) -> QPointF:
+        s = self._scale()
+        return QPointF(self.width() / 2 + (pt.x() - self.center.x()) * s,
+                       self.height() / 2 + (pt.y() - self.center.y()) * s)
+
+    def to_img(self, pos) -> QPointF:
+        s = self._scale()
+        x = self.center.x() + (pos.x() - self.width() / 2) / s
+        y = self.center.y() + (pos.y() - self.height() / 2) / s
+        return QPointF(min(max(x, 0), self._img.width() - 1), min(max(y, 0), self._img.height() - 1))
+
+    def length_px(self) -> Optional[float]:
+        if len(self.points) < 2:
+            return None
+        a, b = self.points
+        return float(np.hypot(a.x() - b.x(), a.y() - b.y()))
+
+    def _near(self, pos) -> Optional[int]:
+        for i, pt in enumerate(self.points):
+            v = self.to_view(pt)
+            if abs(v.x() - pos.x()) < 9 and abs(v.y() - pos.y()) < 9:
+                return i
+        return None
+
+    def mousePressEvent(self, e):
+        if e.button() != Qt.MouseButton.LeftButton:
+            return
+        i = self._near(e.position())
+        if i is None:
+            if len(self.points) >= 2:
+                self.points = []
+            self.points.append(self.to_img(e.position()))
+            i = len(self.points) - 1
+        self._drag = i
+        self._changed()
+
+    def mouseMoveEvent(self, e):
+        if self._drag is not None:
+            self.points[self._drag] = self.to_img(e.position())
+            self._changed()
+        else:
+            self.setCursor(Qt.CursorShape.SizeAllCursor if self._near(e.position()) is not None
+                           else Qt.CursorShape.CrossCursor)
+
+    def mouseReleaseEvent(self, e):
+        self._drag = None
+
+    def wheelEvent(self, e):
+        d = e.angleDelta().y()
+        if not d:
+            return
+        before = self.to_img(e.position())
+        self.zoom = float(np.clip(self.zoom * (1.25 if d > 0 else 0.8), 1.0, 12.0))
+        after = self.to_img(e.position())
+        self.center = QPointF(self.center.x() + before.x() - after.x(), self.center.y() + before.y() - after.y())
+        if self.zoom == 1.0:
+            self.center = QPointF(self._img.width() / 2, self._img.height() / 2)
+        self.update()
+
+    def _changed(self):
+        self.update()
+        if self.on_change:
+            self.on_change()
+
+    def paintEvent(self, _e):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor("#0b1226"))
+        s = self._scale()
+        tl = self.to_view(QPointF(0, 0))
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, self.zoom < 3)
+        p.drawImage(QRectF(tl.x(), tl.y(), self._img.width() * s, self._img.height() * s), self._img)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pts = [self.to_view(pt) for pt in self.points]
+        if len(pts) == 2:
+            p.setPen(QPen(QColor("#ffd23f"), 2))
+            p.drawLine(pts[0], pts[1])
+        for v in pts:
+            p.setPen(QPen(QColor("#ffd23f"), 1.5))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(v, 6, 6)
+            p.drawLine(v + QPointF(-10, 0), v + QPointF(-3, 0))
+            p.drawLine(v + QPointF(3, 0), v + QPointF(10, 0))
+            p.drawLine(v + QPointF(0, -10), v + QPointF(0, -3))
+            p.drawLine(v + QPointF(0, 3), v + QPointF(0, 10))
+        p.setPen(QColor("#ffffff"))
+        msg = self.message or ("Click both ends of something of known length (e.g. a ruler held where the eye is)."
+                               if len(self.points) < 2 else "Drag the points to fine-tune. Click elsewhere to start again.")
+        p.drawText(self.rect().adjusted(10, 8, -10, 0), int(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft),
+                   msg + "   Mouse wheel: zoom.")
+        p.end()
+
+
+def _cv2_imencode(img):
+    import cv2
+    return cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 92])
+
+
+def _cv2_imdecode(buf):
+    import cv2
+    return cv2.imdecode(buf, cv2.IMREAD_UNCHANGED)
+
+
+class CalibrationDialog(QDialog):
+    """Set the image scale (pixels per mm) by measuring a known distance, or by typing it."""
+
+    MAX_CLIP_S = 60
+
+    def __init__(self, camera, current: Optional[float], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Calibrate: pixels per millimetre")
+        self.resize(860, 700)
+        self.camera = camera
+        self.clip: list = []              # JPEG-compressed frames of the calibration clip
+        self.clip_t: list = []
+        self.recording = False
+        self.frame_index: Optional[int] = None
+        v = QVBoxLayout(self)
+        steps = QLabel("1  Hold a ruler in front of the eye, at the eye's distance from the camera.   "
+                       "2  Record a short clip.   3  Scrub to a sharp frame.   4  Click both ends of a "
+                       "known distance and type it in.")
+        steps.setWordWrap(True)
+        steps.setStyleSheet("color: #5a6482;")
+        v.addWidget(steps)
+        first = camera.latest.image if camera is not None and camera.latest is not None else np.zeros((480, 640), np.uint8)
+        self.canvas = MeasureCanvas(first)
+        self.canvas.on_change = self._update
+        self.canvas.on_key = self._step
+        v.addWidget(self.canvas, 1)
+        row = QHBoxLayout()
+        self.rec_btn = QPushButton("\u25cf  Record clip")
+        self.rec_btn.setObjectName("record")
+        self.rec_btn.setStyleSheet("padding: 6px 14px; font-size: 13px;")
+        self.rec_btn.clicked.connect(self._toggle_record)
+        row.addWidget(self.rec_btn)
+        self.live_btn = QPushButton("Live")
+        self.live_btn.setToolTip("Back to the live picture")
+        self.live_btn.clicked.connect(self._go_live)
+        row.addWidget(self.live_btn)
+        self.scrub = QSlider(Qt.Orientation.Horizontal)
+        self.scrub.setEnabled(False)
+        self.scrub.valueChanged.connect(self._show_frame)
+        row.addWidget(self.scrub, 1)
+        self.frame_label = QLabel("live")
+        self.frame_label.setMinimumWidth(130)
+        row.addWidget(self.frame_label)
+        v.addLayout(row)
+        self._timer = QTimer(self)
+        self._timer.setInterval(33)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start()
+        form = QFormLayout()
+        self.mm_spin = QDoubleSpinBox()
+        self.mm_spin.setRange(0.01, 1000)
+        self.mm_spin.setDecimals(2)
+        self.mm_spin.setValue(10.0)
+        self.mm_spin.setSuffix(" mm")
+        self.mm_spin.valueChanged.connect(self._update)
+        form.addRow("Known distance between the points", self.mm_spin)
+        self.direct = QDoubleSpinBox()
+        self.direct.setRange(0, 100000)
+        self.direct.setDecimals(3)
+        self.direct.setSuffix(" px/mm")
+        self.direct.setSpecialValueText("measure above")
+        self.direct.setValue(current or 0)
+        self.direct.valueChanged.connect(self._update)
+        form.addRow("Or type the scale", self.direct)
+        self.result = QLabel()
+        form.addRow(self.result)
+        v.addLayout(form)
+        self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        v.addWidget(self.buttons)
+        self._typed = bool(current)
+        self._update()
+
+    # ---- clip ------------------------------------------------------------------
+    def _tick(self) -> None:
+        cam = self.camera
+        if cam is None or cam.latest is None or self.frame_index is not None:
+            return
+        f = cam.latest
+        self.canvas.set_image(f.image)
+        if self.recording:
+            if not self.clip_t or f.t != self.clip_t[-1]:
+                ok, buf = _cv2_imencode(f.image)
+                if ok:
+                    self.clip.append(buf)
+                    self.clip_t.append(f.t)
+            dur = self.clip_t[-1] - self.clip_t[0] if len(self.clip_t) > 1 else 0.0
+            self.frame_label.setText(f"recording {dur:4.1f} s")
+            if dur >= self.MAX_CLIP_S:
+                self._toggle_record()
+
+    def _toggle_record(self) -> None:
+        if self.camera is None:
+            return
+        if not self.recording:
+            self.clip, self.clip_t = [], []
+            self.frame_index = None
+            self.recording = True
+            self.rec_btn.setText("\u25a0  Stop")
+            self.scrub.setEnabled(False)
+            self.canvas.message = "Recording - hold the ruler steady in front of the eye, then click Stop."
+        else:
+            self.recording = False
+            self.rec_btn.setText("\u25cf  Record clip")
+            self.canvas.message = ""
+            if self.clip:
+                self.scrub.blockSignals(True)
+                self.scrub.setRange(0, len(self.clip) - 1)
+                self.scrub.setValue(len(self.clip) // 2)
+                self.scrub.blockSignals(False)
+                self.scrub.setEnabled(True)
+                self._show_frame(self.scrub.value())
+                self.canvas.setFocus()
+        self.canvas.update()
+
+    def _show_frame(self, i: int) -> None:
+        if not self.clip:
+            return
+        img = _cv2_imdecode(self.clip[i])
+        if img is None:
+            return
+        self.frame_index = i
+        self.canvas.set_image(img)
+        t = self.clip_t[i] - self.clip_t[0]
+        self.frame_label.setText(f"frame {i + 1} / {len(self.clip)}  ({t:.2f} s)")
+
+    def _step(self, step: int, big: bool) -> None:
+        if self.scrub.isEnabled():
+            self.scrub.setValue(self.scrub.value() + step * (10 if big else 1))
+
+    def _go_live(self) -> None:
+        if self.recording:
+            return
+        self.frame_index = None
+        self.frame_label.setText("live")
+
+    def done(self, r) -> None:
+        self._timer.stop()
+        self.clip = []
+        super().done(r)
+
+    def px_per_mm(self) -> Optional[float]:
+        L = self.canvas.length_px()
+        if L is not None and L >= 5:
+            return L / self.mm_spin.value()
+        if self.direct.value() > 0:
+            return self.direct.value()
+        return None
+
+    def method(self) -> str:
+        L = self.canvas.length_px()
+        if L is not None and L >= 5:
+            where = (f" on frame {self.frame_index + 1} of a {len(self.clip)}-frame calibration clip"
+                     if self.frame_index is not None else " on the live picture")
+            return f"measured: {L:.1f} px over {self.mm_spin.value():g} mm{where}"
+        return "typed in"
+
+    def _update(self, *_a):
+        L = self.canvas.length_px()
+        if L is not None and L >= 5:
+            self.direct.blockSignals(True)
+            self.direct.setValue(L / self.mm_spin.value())
+            self.direct.blockSignals(False)
+            self.result.setText(f"Line: {L:.1f} px = {self.mm_spin.value():g} mm  ->  "
+                                f"<b>{L / self.mm_spin.value():.3f} px/mm</b>  ({self.mm_spin.value() / L * 1000:.1f} \u00b5m per pixel)")
+        elif self.direct.value() > 0:
+            self.result.setText(f"Scale: <b>{self.direct.value():.3f} px/mm</b>")
+        else:
+            self.result.setText("Click two points in the picture, or type the scale.")
+        self.buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(self.px_per_mm() is not None)
+
+
+# --------------------------------------------------------------------------
 class MainWindow(QMainWindow):
     def __init__(self, settings: Optional[QSettings] = None):
         super().__init__()
         self.settings = settings if settings is not None else QSettings("jerjely", APP_NAME)
         self.camera: Optional[CameraThread] = None
+        self.scale: Optional[dict] = None       # {"px_per_mm", "size", "set", "method"}
         self.stream: Optional[ArduinoStream] = None
         self.recording: Optional[Recording] = None
         self.last_folder: Optional[Path] = None
@@ -300,6 +860,8 @@ class MainWindow(QMainWindow):
         self._pins_changed()
         self._image_changed()
         self._zoom_changed()
+        self._apply_pupil()
+        self._update_scale_label()
         self._update_enabled()
         self._timer = QTimer(self)
         self._timer.setInterval(33)
@@ -374,6 +936,14 @@ class MainWindow(QMainWindow):
         self.cam_btn = QPushButton("Open camera")
         self.cam_btn.setObjectName("primary")
         form.addRow(self.cam_btn)
+        self.scale_label = QLabel()
+        self.scale_label.setWordWrap(True)
+        self.calib_btn = QPushButton("Calibrate...")
+        self.calib_btn.setToolTip("Measure a ruler held in front of the eye to get pupil size and position in mm")
+        row = QHBoxLayout()
+        row.addWidget(self.scale_label, 1)
+        row.addWidget(self.calib_btn)
+        form.addRow("Scale", row)
         self.cam_status = QLabel()
         self.cam_status.setWordWrap(True)
         form.addRow(self.cam_status)
@@ -521,8 +1091,37 @@ class MainWindow(QMainWindow):
         self.adjust_rec_chk.setToolTip("Untick to record the camera's original image; the adjustments then "
                                        "only change the preview")
         self.adjust_rec_chk.setChecked(True)
-        v.addWidget(self.adjust_rec_chk)
+        row = QHBoxLayout()
+        row.addWidget(self.adjust_rec_chk)
+        row.addSpacing(16)
+        self.pupil_chk = QCheckBox("Track pupil")
+        self.pupil_chk.setToolTip("Find the pupil inside the eye box in every frame. Drag a box around the "
+                                  "eye in the picture. Pupil x, y and diameter are saved in frames.csv.")
+        row.addWidget(self.pupil_chk)
+        self.pupil_show_chk = QCheckBox("Show pupil view")
+        self.pupil_show_chk.setChecked(True)
+        self.pupil_show_chk.setToolTip("Hide or show the outline and the pupil plots. Tracking and saving "
+                                       "carry on either way.")
+        row.addWidget(self.pupil_show_chk)
+        row.addWidget(QLabel("Threshold"))
+        self.pupil_sens = QSlider(Qt.Orientation.Horizontal)
+        self.pupil_sens.setRange(-50, 50)
+        self.pupil_sens.setValue(0)
+        self.pupil_sens.setMinimumWidth(60)
+        self.pupil_sens.setToolTip("Move right if the outline is smaller than the pupil, left if it spills "
+                                   "over the iris. The pixels counted as pupil show in red while you move it.")
+        row.addWidget(self.pupil_sens, 1)
+        v.addLayout(row)
         right.addWidget(box, 1)
+
+        # pupil
+        self.pupil_box = QGroupBox("Pupil")
+        v = QVBoxLayout(self.pupil_box)
+        self.pupil_plot = PupilPlot()
+        self.pupil_plot.on_wheel = self._pupil_wheel
+        v.addWidget(self.pupil_plot)
+        self.pupil_box.setVisible(False)
+        right.addWidget(self.pupil_box, 0)
 
         # signals
         box = QGroupBox("Arduino signals")
@@ -562,6 +1161,7 @@ class MainWindow(QMainWindow):
         # signals
         self.scan_btn.clicked.connect(self.scan)
         self.cam_btn.clicked.connect(self._toggle_camera)
+        self.calib_btn.clicked.connect(self.calibrate)
         self.refresh_btn.clicked.connect(self.refresh_ports)
         self.ard_btn.clicked.connect(self._toggle_arduino)
         self.flash_btn.clicked.connect(self.upload_sketch)
@@ -573,6 +1173,10 @@ class MainWindow(QMainWindow):
         self.auto_btn.clicked.connect(self._auto_image)
         self.reset_btn.clicked.connect(self._reset_image)
         self.window_combo.currentIndexChanged.connect(self._zoom_changed)
+        self.pupil_chk.toggled.connect(self._pupil_toggled)
+        self.pupil_show_chk.toggled.connect(self._pupil_view_changed)
+        self.pupil_sens.valueChanged.connect(self._pupil_params_changed)
+        self.view.on_eye_box = self._eye_box_drawn
         self.mic_combo.currentIndexChanged.connect(self._zoom_changed)
         self.freeze_btn.toggled.connect(
             lambda on: self.freeze_btn.setText("Resume" if on else "Freeze"))
@@ -648,6 +1252,24 @@ class MainWindow(QMainWindow):
                 except (TypeError, ValueError):
                     pass
         pick(self.window_combo, "scope_window")
+        try:
+            import json as _json
+            sc = s.value("scale", "")
+            self.scale = _json.loads(sc) if sc else None
+        except Exception:
+            self.scale = None
+        box = s.value("eye_box")
+        if box:
+            try:
+                self.view.eye_box = tuple(int(v) for v in str(box).split(","))
+            except ValueError:
+                pass
+        try:
+            self.pupil_sens.setValue(int(s.value("pupil_sensitivity", 0)))
+        except (TypeError, ValueError):
+            pass
+        self.pupil_show_chk.setChecked(str(s.value("pupil_show", "true")).lower() == "true")
+        self.pupil_chk.setChecked(str(s.value("pupil_track", "false")).lower() == "true")
         pick(self.mic_combo, "scope_mic")
         geo = s.value("geometry")
         if geo is not None:
@@ -676,6 +1298,12 @@ class MainWindow(QMainWindow):
         for key, (sl, _lab) in self.sliders.items():
             s.setValue(f"image_{key}", sl.value())
         s.setValue("scope_window", self.window_combo.currentData())
+        import json as _json
+        s.setValue("scale", _json.dumps(self.scale) if self.scale else "")
+        s.setValue("eye_box", ",".join(map(str, self.view.eye_box)) if self.view.eye_box else "")
+        s.setValue("pupil_sensitivity", self.pupil_sens.value())
+        s.setValue("pupil_show", self.pupil_show_chk.isChecked())
+        s.setValue("pupil_track", self.pupil_chk.isChecked())
         s.setValue("scope_mic", self.mic_combo.currentData())
         s.setValue("geometry", self.saveGeometry())
         s.sync()
@@ -735,6 +1363,8 @@ class MainWindow(QMainWindow):
             QApplication.restoreOverrideCursor()
         cam.set_image_settings(self._image_settings())
         self.camera = cam
+        self._apply_pupil()
+        self._update_scale_label()
         self._update_enabled()
         return True
 
@@ -775,6 +1405,110 @@ class MainWindow(QMainWindow):
     def _reset_image(self) -> None:
         for key, val in (("brightness", 0), ("contrast", 100), ("gamma", 100)):
             self.sliders[key][0].setValue(val)
+
+    # ---- calibration ---------------------------------------------------------
+    def _valid_scale(self) -> Optional[dict]:
+        """The saved scale, if it was measured at the current camera picture size."""
+        sc = self.scale
+        if not sc:
+            return None
+        if self.camera is not None and list(self.camera.frame_size) != list(sc.get("size", [])):
+            return None
+        return sc
+
+    def _update_scale_label(self) -> None:
+        sc = self.scale
+        if not sc:
+            self.scale_label.setText('<span style="color:#8a93ad">not set (sizes in pixels)</span>')
+        elif self.camera is not None and self._valid_scale() is None:
+            w, h = sc["size"]
+            self.scale_label.setText(f'<span style="color:#a32035">measured at {w} x {h}: calibrate again '
+                                     f'for this picture size</span>')
+        else:
+            w, h = sc["size"]
+            self.scale_label.setText(f'{sc["px_per_mm"]:.2f} px/mm <span style="color:#8a93ad">'
+                                     f'({w} x {h}, {sc["set"][:10]})</span>')
+        vs = self._valid_scale()
+        self.pupil_plot.px_per_mm = vs["px_per_mm"] if vs else None
+
+    def calibrate(self) -> bool:
+        if self.camera is None:
+            QMessageBox.information(self, "Calibrate", "Open the camera first.")
+            return False
+        vs = self._valid_scale()
+        dlg = CalibrationDialog(self.camera, vs["px_per_mm"] if vs else None, self)
+        self._calib_dialog = dlg                      # for the self-test
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return False
+        return self.apply_calibration(dlg)
+
+    def apply_calibration(self, dlg) -> bool:
+        if dlg.px_per_mm() is None or self.camera is None:
+            return False
+        from datetime import datetime as _dt
+        self.scale = {"px_per_mm": round(float(dlg.px_per_mm()), 4), "size": list(self.camera.frame_size),
+                      "set": _dt.now().astimezone().isoformat(timespec="seconds"), "method": dlg.method()}
+        self._update_scale_label()
+        return True
+
+    # ---- pupil tracking ------------------------------------------------------
+    def _pupil_params(self) -> PupilParams:
+        box = self.view.eye_box
+        if box and self.camera is not None:
+            W, H = self.camera.frame_size
+            x, y, w, h = box
+            if x >= W or y >= H:
+                box = None                  # box from a camera with a larger picture
+            else:
+                box = (x, y, min(w, W - x), min(h, H - y))
+        return PupilParams(box=box, sensitivity=self.pupil_sens.value())
+
+    def _apply_pupil(self) -> None:
+        cam = self.camera
+        on = self.pupil_chk.isChecked()
+        self.view.drawing_enabled = on
+        if cam is not None:
+            if on:
+                if cam.pupil_tracker is None:
+                    cam.pupil_log.clear()
+                    cam.pupil_tracker = PupilTracker(self._pupil_params())
+                else:
+                    cam.pupil_tracker.set_params(self._pupil_params())
+            else:
+                cam.pupil_tracker = None
+        self._pupil_view_changed()
+
+    def _pupil_toggled(self, *_a) -> None:
+        self._apply_pupil()
+
+    def _pupil_view_changed(self, *_a) -> None:
+        on = self.pupil_chk.isChecked()
+        show = self.pupil_show_chk.isChecked()
+        self.view.show_pupil = show
+        self.pupil_box.setVisible(on and show)
+        self.pupil_sens.setEnabled(on)
+        self.pupil_show_chk.setEnabled(on)
+        self.view.update()
+
+    def _eye_box_drawn(self, box) -> None:
+        if self.camera is not None:
+            self.camera.pupil_log.clear()
+        self._pupil_params_changed()
+
+    def _pupil_params_changed(self, *_a) -> None:
+        cam = self.camera
+        if cam is not None and cam.pupil_tracker is not None:
+            cam.pupil_tracker.set_params(self._pupil_params())
+            cam.pupil_want_mask = True                   # show the red pixels while tuning
+            self._mask_until = time.time() + 2.5
+        if self.recording is not None:
+            self.recording.pupil_changed = True
+
+    def _pupil_wheel(self, step: int) -> None:
+        w = PupilPlot.WINDOWS
+        i = min(max(w.index(self.pupil_plot.window_s) + step if self.pupil_plot.window_s in w else 1, 0), len(w) - 1)
+        self.pupil_plot.window_s = w[i]
+        self.pupil_plot.update()
 
     # ---- signal zoom --------------------------------------------------------
     def _zoom_changed(self, *_a) -> None:
@@ -1006,7 +1740,7 @@ class MainWindow(QMainWindow):
             Path(self.dir_edit.text()).mkdir(parents=True, exist_ok=True)
             rec = Recording(self.dir_edit.text(), self.name_edit.text(), self.camera, self.stream,
                             self.codec_combo.currentData(), self._threshold_adc(), extra,
-                            adjust_video=self.adjust_rec_chk.isChecked())
+                            adjust_video=self.adjust_rec_chk.isChecked(), scale=self._valid_scale())
             rec.start()
         except Exception as exc:
             QMessageBox.critical(self, "Cannot start recording", str(exc))
@@ -1059,6 +1793,14 @@ class MainWindow(QMainWindow):
                 return
             f = cam.latest
             if f is not None:
+                self.view.pupil = f.pupil
+                if cam.pupil_want_mask and time.time() > getattr(self, "_mask_until", 0):
+                    cam.pupil_want_mask = False
+                self.view.mask = f.pupil.mask if (f.pupil is not None and cam.pupil_want_mask) else None
+                if cam.pupil_tracker is not None and self.pupil_box.isVisible():
+                    self.pupil_plot.set_closeup(f.raw if f.raw is not None else f.image,
+                                                cam.pupil_tracker.params.box, f.pupil)
+                    self.pupil_plot.set_data(list(cam.pupil_log))
                 self.view.set_frame(f.image)
                 self.view.overlay = f"{cam.measured_fps():.1f} fps"
             w, h = cam.frame_size
@@ -1109,6 +1851,7 @@ class MainWindow(QMainWindow):
             w.setEnabled(not cam)
         self.codec_combo.setEnabled(not rec)
         self.cam_btn.setText("Close camera" if cam else "Open camera")
+        self.calib_btn.setEnabled(cam and not rec)
         self.cam_btn.setEnabled(not rec)
         if not cam:
             self.cam_status.setText('<span style="color:#8a93ad">&#9679;</span> No camera open')
@@ -1122,6 +1865,7 @@ class MainWindow(QMainWindow):
             self.sig_label.setText("")
         self.thr_spin.setEnabled(not rec)
         self.grey_chk.setEnabled(not rec)
+        self.pupil_chk.setEnabled(not rec)
         self.adjust_rec_chk.setEnabled(not rec)
         for w in (self.dir_edit, self.dir_btn, self.name_edit):
             w.setEnabled(not rec)
