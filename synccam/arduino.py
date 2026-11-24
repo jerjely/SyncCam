@@ -200,6 +200,7 @@ class SimulatedArduino:
         self.ttl_threshold = 512
         self.led = False
         self.ttl_ch, self.mic_ch, self.ir_pin = DEFAULT_PINS
+        self._ir_log = [(0.0, IR_OFF)]          # (perf_counter, mode): when the IR LED mode changed
         self._t0 = 0.0
         self._n = 0
         self._pulse_t0 = time.perf_counter()
@@ -248,6 +249,7 @@ class SimulatedArduino:
                 self._generate(time.perf_counter())
                 self.ir_mode = int(rest)
                 self._pulse_t0 = time.perf_counter()
+                self._ir_log.append((self._pulse_t0, self.ir_mode))
             elif c == "P":
                 try:
                     per, w = (int(x) for x in rest.split(","))
@@ -312,6 +314,19 @@ class SimulatedArduino:
         self._out += pk.tobytes()
         self._n += n_due
         self.led = bool(led[-1])
+
+    def led_at(self, t: float) -> bool:
+        """IR LED on/off at computer time t (on/off modes; used by the test-pattern camera,
+        which shows the scene as lit at t = now - its simulated camera delay)."""
+        mode = IR_OFF
+        for t_change, m in self._ir_log:
+            if t_change <= t:
+                mode = m
+            else:
+                break
+        if mode in (IR_FOLLOW, IR_PULSE):
+            return self.current_led()
+        return mode == IR_ON
 
     def current_led(self) -> bool:
         """LED state right now (used by the test-pattern camera)."""

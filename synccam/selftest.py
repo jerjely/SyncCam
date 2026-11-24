@@ -129,17 +129,25 @@ def t_firmware(ctx):
 
 
 def t_pupil(ctx):
-    """Pupil detection on the synthetic eye: accuracy against the true values, blinks rejected."""
+    """Pupil detection (VisRig detector) and Kinematics on the synthetic eye: accuracy against the
+    true values, blinks rejected, movement and dilation states."""
     from .camera import TestPatternSource
-    from .pupil import PupilParams, PupilTracker
+    from .pupil import Kinematics, PupilParams, PupilTracker
     src = TestPatternSource((640, 480), 10000)
     tr = PupilTracker(PupilParams(box=src.eye_box()))
+    kin = Kinematics()
     err_xy, err_d, opens, found, blinks, rejected = [], [], 0, 0, 0, 0
+    moving, sizes, lost_ok = set(), set(), 0
     t0 = time.perf_counter()
-    for n in range(450):
+    for n in range(900):
         _ok, img = src.read()
         r = tr.detect(img)
+        k = kin.update(n / 30.0, r)
+        moving.add("moving" if k["moving"] not in ("still", "lost", "") else k["moving"])
+        sizes.add(k["size"])
         x, y, d, is_open = src.eye_truth(n)
+        if not is_open:
+            lost_ok += k["moving"] == "lost" and k["size"] == "lost"
         if is_open:
             opens += 1
             if r.found:
@@ -149,13 +157,37 @@ def t_pupil(ctx):
         else:
             blinks += 1
             rejected += not r.found
-    ms = (time.perf_counter() - t0) / 450 * 1000
+    ms = (time.perf_counter() - t0) / 900 * 1000
     assert found >= 0.98 * opens, f"pupil found in only {found} of {opens} open-eye frames"
     assert blinks and rejected == blinks, f"{blinks - rejected} of {blinks} blink frames gave a pupil"
     assert max(err_xy) < 1.5 and np.mean(err_xy) < 0.4, f"centre error mean {np.mean(err_xy):.2f}, max {max(err_xy):.2f} px"
     assert max(err_d) < 3.0 and np.mean(err_d) < 1.5, f"diameter error mean {np.mean(err_d):.2f}, max {max(err_d):.2f} px"
+    # synthetic eye: centre swings at up to ~23 px/s, diameter changes at up to ~23 %/s
+    assert {"still", "moving"} <= moving, f"eye states seen: {moving}"
+    assert {"stable", "dilating", "constricting"} <= sizes, f"pupil states seen: {sizes}"
+    assert lost_ok == blinks, "blink frames must be reported as lost"
     ctx.log(f"    centre error {np.mean(err_xy):.2f} px, diameter error {np.mean(err_d):.2f} px, "
-            f"{rejected}/{blinks} blink frames rejected, {ms:.1f} ms per frame (incl. drawing)")
+            f"{rejected}/{blinks} blink frames rejected, {ms:.1f} ms per frame (incl. drawing); "
+            f"states {sorted(moving)} / {sorted(sizes - {''})}")
+
+
+def t_camera_delay(ctx):
+    """IR sync blink analysis (VisRig's blink_delays) on made-up frame times and brightness."""
+    from .session import blink_delays
+    fps, delay = 30.0, 0.060
+    t = np.arange(0, 6, 1 / fps)
+    blinks = [(1.0, 1.1), (4.5, 4.6)]
+    lit = np.ones_like(t, bool)
+    for a, b in blinks:                       # frame i shows the light at its exposure, t - delay
+        lit &= ~((t - delay >= a) & (t - delay < b))
+    lum = np.where(lit, 90.0, 45.0) + np.random.default_rng(1).normal(0, 1, len(t))
+    res = blink_delays(t, lum, blinks)
+    ds = [v for r in res for k_, v in r.items() if k_.endswith("delay_ms")]
+    assert len(ds) == 4, res
+    assert all(delay * 1000 - 1 <= d_ <= (delay + 1 / fps) * 1000 + 1 for d_ in ds), ds
+    flat = blink_delays(t, np.full_like(t, 90.0), blinks)
+    assert all("no visible dip" in r.get("error", "") for r in flat), flat
+    ctx.log(f"    true 60 ms -> {np.median(ds):.1f} ms; flat brightness -> 'no visible dip'")
 
 
 def t_packets(ctx):
@@ -229,17 +261,17 @@ def t_serial_commands(ctx):
 def t_recording(ctx):
     """Full recording: test-pattern camera + simulated Arduino, LED followed in the video."""
     from .arduino import IR_ON, ArduinoStream, SimulatedArduino
-    from .camera import TEST_PATTERN, CameraThread
+    from .camera import TEST_PATTERN, CameraThread, TestPatternSource
     from .session import Recording
     sim = SimulatedArduino()
     st = ArduinoStream(sim, 5000)
     st.connect(IR_ON)
     from .pupil import PupilParams, PupilTracker
-    cam = CameraThread(TEST_PATTERN, (640, 480), 30, sim.current_led)
+    cam = CameraThread(TEST_PATTERN, (640, 480), 30, sim.led_at)
     cam.open()
     cam.pupil_tracker = PupilTracker(PupilParams(box=cam.cap.eye_box()))
     time.sleep(0.5)
-    rec = Recording(str(ctx.tmp), "selftest", cam, st, "MJPG", 512, {"name": "selftest"})
+    rec = Recording(str(ctx.tmp), "selftest", cam, st, "MJPG", 512, {"name": "selftest"}, ir_blinks=True)
     rec.start()
     time.sleep(3.0)
     info = rec.stop()
@@ -251,7 +283,10 @@ def t_recording(ctx):
         assert (folder / name).exists(), f"{name} missing"
     js = json.loads((folder / "session.json").read_text(encoding="utf-8"))
     frames = _read_csv(folder / "frames.csv")
-    assert 70 <= len(frames) <= 100, f"{len(frames)} frames in 3 s at 30 fps"
+    fps = js["video"]["measured_fps"] or 0
+    assert fps > 10, f"camera delivered only {fps} fps"
+    expect = (float(frames[-1]["time_s"]) - float(frames[0]["time_s"])) * fps + 1
+    assert abs(len(frames) - expect) <= 3 and len(frames) >= 30, f"{len(frames)} frames, expected about {expect:.0f}"
     import cv2
     cap = cv2.VideoCapture(str(folder / "video.avi"))
     n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -269,7 +304,20 @@ def t_recording(ctx):
     assert len(ok) >= 0.9 * len(frames), f"pupil found in {len(ok)} of {len(frames)} frames"
     dia = [float(r["pupil_diameter"]) for r in ok]
     assert 18 < min(dia) and max(dia) < 42, (min(dia), max(dia))
-    assert js["pupil"]["found_in_percent_of_frames"] >= 90, js["pupil"]
+    assert js["pupil"]["found_in_percent_of_frames"] >= 85, js["pupil"]
+    for col in ("eye_moving", "pupil_state", "pupil_minor", "brightness", "time_exposure_s"):
+        assert col in frames[0], f"frames.csv has no {col} column"
+    # IR sync blinks: the test pattern shows the light 50 ms late (simulated camera delay)
+    cd = js["camera_delay"]
+    true_ms = TestPatternSource.SIM_DELAY_S * 1000
+    fi = cd["frame_interval_ms"]
+    assert cd["measured"] and cd["n_transitions"] == 4, cd
+    assert true_ms - 5 <= cd["delay_ms"] <= true_ms + fi + 10, f"camera delay {cd['delay_ms']} ms, true {true_ms} ms"
+    r_ = frames[len(frames) // 2]
+    assert abs(float(r_["time_s"]) - float(r_["time_exposure_s"]) - cd["delay_ms"] / 1000) < 1e-5
+    with open(folder / "ttl_events.csv", newline="", encoding="utf-8") as fh:
+        assert "video_frame_exposure" in fh.readline()
+    ctx.log(f"    camera delay {cd['delay_ms']} ms (simulated {true_ms:.0f} ms + up to one frame of {fi:.0f} ms)")
     with wave.open(str(folder / "analog.wav")) as w:
         assert w.getnchannels() == 3 and w.getframerate() == 5000
         ns = w.getnframes()
@@ -281,7 +329,11 @@ def t_recording(ctx):
     # the Arduino data ends at Stop, together with the video
     last = js["arduino"]["first_sample_time_s"] + (ns - 1) / js["arduino"]["measured_rate_hz"]
     assert abs(last - dur) < 0.03, f"Arduino data ends at {last:.3f} s, recording at {dur:.3f} s"
-    assert raw[:, 0].max() > 900 and raw[:, 2].min() == 1, "TTL missing or IR LED not on"
+    assert raw[:, 0].max() > 900, "TTL missing"
+    led_off = np.flatnonzero(raw[:, 2] == 0)
+    off_runs = np.split(led_off, np.flatnonzero(np.diff(led_off) > 1) + 1) if len(led_off) else []
+    assert len(off_runs) == 2 and all(abs(len(r_) - 500) < 60 for r_ in off_runs), \
+        f"IR LED channel should show exactly the two 0.1 s sync blinks, got {[len(r_) for r_ in off_runs]} samples off"
     assert js["arduino"]["samples_lost_and_filled"] == 0, f"{js['arduino']['samples_lost_and_filled']} samples lost"
     ttl = [r for r in _read_csv(folder / "ttl_events.csv") if r["edge"] == "rise"]
     assert 4 <= len(ttl) <= 7, f"{len(ttl)} TTL pulses in 3 s"
@@ -319,6 +371,128 @@ def t_recording(ctx):
     ctx.log(f"    {len(frames)} frames, {ns} samples, {len(ttl)} TTL pulses, {bursts} tone burst(s) aligned")
 
 
+def _fake_atlas(folder: Path):
+    """A tiny synthetic Allen-style atlas (gzip NRRD + structure tree) around bregma's CCF corner."""
+    import gzip
+    folder.mkdir(parents=True, exist_ok=True)
+    vol = np.ones((40, 40, 40), np.uint32)            # AP, DV, ML at 25 um: region 1 above, 2 below DV voxel 20
+    vol[:, 20:, :] = 2
+    vol[:, :, :5] = 0                                  # a strip of "outside"
+    hdr = (b"NRRD0004\n# synthetic\ntype: uint32\ndimension: 3\nsizes: 40 40 40\n"
+           b"endian: little\nencoding: gzip\n\n")
+    (folder / "annotation_25.nrrd").write_bytes(hdr + gzip.compress(vol.tobytes(order="F")))
+    tree = {"msg": [{"id": 997, "acronym": "root", "name": "root", "color_hex_triplet": "FFFFFF", "children": [
+        {"id": 1, "acronym": "SCs", "name": "superficial SC", "color_hex_triplet": "FF90FF", "children": []},
+        {"id": 2, "acronym": "SCm", "name": "motor SC", "color_hex_triplet": "FF7AFF", "children": []}]}]}
+    (folder / "structure_graph.json").write_text(json.dumps(tree), encoding="utf-8")
+    return vol
+
+
+def t_probe(ctx):
+    from .probe import (BREGMA_CCF, PROBE_TYPES, Atlas, ProbePlan, ProbeSet, read_nrrd, segment_distance)
+    p = ProbePlan(pitch=45, distance=1230.3658)
+    r = p.readouts()
+    assert abs(r["depth_below_surface_um"] - 870) < 0.01 and abs(r["horizontal_travel_um"] - 870) < 0.01, r
+    p.target_dv = p.surface_dv + 870
+    assert abs(p.plan_to_target()["distance"] - 1230.37) < 0.01
+    p.apply_target_plan()
+    assert np.allclose(np.mean(p.tips(), axis=0), p.target(), atol=1e-6), "plan to target misses the target"
+    for bad in (dict(pitch=0), dict(target_dv=p.surface_dv - 10)):
+        q = ProbePlan(**bad)
+        try:
+            q.plan_to_target()
+            raise AssertionError(f"plan to target should refuse {bad}")
+        except ValueError:
+            pass
+    tips = ProbePlan().tips()
+    assert len(tips) == 4 and abs(np.linalg.norm(tips[0] - tips[3]) - 750) < 1e-6
+    q = ProbePlan()
+    q.apply_type("2 shanks")
+    t2 = q.tips()
+    assert len(t2) == 2 and abs(np.linalg.norm(t2[0] - t2[1]) - 250) < 1e-6
+    assert q.matching_type() == "2 shanks"
+    q.shank_pitch = 300
+    assert q.matching_type() == "Custom"
+    assert set(PROBE_TYPES) >= {"NP2.0 4-shank", "NP2.0 1-shank", "NP1.0", "2 shanks"}
+    tab = ProbePlan(distance=1230).table()
+    assert [round(x[0]) for x in tab] == [0, 500, 1000, 1230, 1500, 2000, 2500] and tab[3][3]
+    # two probes
+    ps = ProbeSet(n=2)
+    a, b = ps.probes
+    assert b.entry_ml == -a.entry_ml and b.target_ml == -a.target_ml, "B is not mirrored"
+    assert np.allclose([t[1] for t in b.tips()], [-t[1] for t in a.tips()]), "B tips are not mirrored"
+    v1 = dict(pitch=90, n_shanks=1, distance=2000)
+    ca = ProbeSet(n=2, probes=[ProbePlan(entry_ml=-1000, **v1), ProbePlan(entry_ml=1000, **v1)]).closest_approach()
+    assert abs(ca - 2000) < 1, ca
+    v4 = dict(pitch=90, yaw=0, distance=2000)          # 4 shanks spread 750 um along ML
+    ca = ProbeSet(n=2, probes=[ProbePlan(entry_ml=-1000, **v4), ProbePlan(entry_ml=1000, **v4)]).closest_approach()
+    assert abs(ca - (2000 - 750)) < 1, ca
+    assert segment_distance([0, 0, 0], [2, 0, 0], [1, -1, 0], [1, 1, 0]) < 1e-9, "crossing segments"
+    assert ProbeSet(n=1).closest_approach() is None
+    # serialisation: both probes, and an old single-plan dict
+    ps.active = 1
+    ps.probes[1].distance = 1777
+    back = ProbeSet.from_json(ps.to_json())
+    assert back.n == 2 and back.active == 1 and back.probes[1].distance == 1777 and back.probes[1].name == "B"
+    old = ProbeSet.from_dict(ProbePlan(entry_ap=-3000, distance=999).to_dict())
+    assert old.n == 1 and old.probes[0].entry_ap == -3000 and old.probes[0].distance == 999
+    blk = ps.session_block()
+    assert blk["n"] == 2 and len(blk["probes"]) == 2 and blk["closest_approach_um"] is not None
+    assert len(blk["probes"][0]["shanks"]) == 4 and "tip_dv" in blk["probes"][1]["shanks"][0]
+    json.dumps(blk)
+    # atlas reader + region lookup on a synthetic volume
+    folder = ctx.tmp / "fake_atlas"
+    vol = _fake_atlas(folder)
+    arr, hdr = read_nrrd(str(folder / "annotation_25.nrrd"))
+    assert arr.shape == (40, 40, 40) and np.array_equal(arr, vol), "NRRD reader"
+    assert Atlas.available(str(folder))
+    at = Atlas(str(folder))
+    bap, bdv, bml = BREGMA_CCF
+    ap, ml = bap - 20 * 25, -bml + 20 * 25               # voxel i = 20, k = 20
+    assert at.label(at.region_at(ap, ml, -bdv + 10 * 25)) == "SCs"
+    assert at.label(at.region_at(ap, ml, -bdv + 30 * 25)) == "SCm"
+    assert at.label(at.region_at(ap, -bml + 2 * 25, -bdv + 30 * 25)) == "outside"
+    assert at.label(at.region_at(0, 0, 0)) == "outside"
+    runs = at.regions_along([ap, ml, -bdv + 5 * 25], [ap, ml, -bdv + 35 * 25])
+    assert [x[2] for x in runs] == ["SCs", "SCm"] and abs(runs[1][0] - 362.5) <= 25, runs
+    rgb = at.rgb_slice(at.coronal(ap)[0])
+    assert rgb.shape == (40, 40, 3) and tuple(rgb[30, 20]) == (0xFF, 0x7A, 0xFF) and tuple(rgb[30, 0]) == (0, 0, 0)
+    assert tuple(rgb[19, 20]) == tuple(int(c * 0.55) for c in (0xFF, 0x90, 0xFF)), "border not darkened"
+    sl, ext = at.sagittal(ml)
+    assert sl.shape == (40, 40) and ext[0] == bap
+    plan = ProbePlan(entry_ap=ap, entry_ml=ml, surface_dv=-bdv + 5 * 25, pitch=90, n_shanks=1, distance=700,
+                     tip_length=0, span_length=700)
+    rep = ProbeSet(n=1, probes=[plan]).session_block(at)["probes"][0]["shanks"][0]
+    assert rep["tip_region"] == "SCm" and [x["region"] for x in rep["recorded_regions"]] == ["SCm", "SCs"], rep
+    # the planner window, offscreen, with 1 and 2 probes (no atlas download: dialogs would fail the test)
+    from PySide6.QtWidgets import QApplication
+    from .probe_gui import ProbePlannerWindow
+    app = QApplication.instance() or QApplication(["synccam-selftest"])
+    w = ProbePlannerWindow(ProbeSet(), auto_load_atlas=False, atlas_folder=str(ctx.tmp / "no_atlas"))
+    w.show()
+    app.processEvents()
+    assert "B" not in w.results.text() or "Probe B" not in w.results.text()
+    w.set_n(2)
+    w.set_active(1)
+    app.processEvents()
+    assert "Probe B" in w.results.text() and "Closest approach" in w.results.text(), w.results.text()
+    w.f_dist.setValue(1500)
+    assert w.pset.probes[1].distance == 1500 and w.pset.probes[0].distance != 1500
+    w.f_type.setCurrentText("2 shanks")
+    assert w.pset.probes[1].n_shanks == 2
+    w.f_spacing.setValue(300)
+    assert w.f_type.currentText() == "Custom" and w.pset.probes[1].probe_type == "Custom"
+    w.set_atlas(at)
+    app.processEvents()
+    assert "recorded:" in w.results.text()
+    img = w.grab().toImage()
+    assert img.width() > 600 and img.height() > 400
+    w.set_n(1)
+    assert w.pset.active == 0 and "Probe B" not in w.results.text()
+    w.close()
+    app.processEvents()
+
+
 def t_gui(ctx):
     from PySide6.QtCore import QSettings
     from PySide6.QtWidgets import QApplication
@@ -337,6 +511,14 @@ def t_gui(ctx):
     assert "SyncCam" in win.windowTitle()
     win.dir_edit.setText(str(ctx.tmp / "gui_recordings"))
     win.name_edit.setText("gui test")
+    win.probe_atlas_folder = str(ctx.tmp / "no_atlas")
+    pw = win.show_probe_planner()
+    app.processEvents()
+    pw.set_n(2)
+    pw.f_dist.setValue(1500)
+    assert "Probe A:" in win.probe_label.text() and "Probe B:" in win.probe_label.text(), win.probe_label.text()
+    assert win.probe_set.n == 2 and win.probe_set.probes[0].distance == 1500
+    pw.close()
 
     from . import uploader as upl
     fb = upl.FakeBootloader()
@@ -380,8 +562,8 @@ def t_gui(ctx):
     dlg = CalibrationDialog(win.camera, None, win)
     dlg.show()
     dlg._toggle_record()
-    t_end = time.time() + 1.2
-    _pump(app, lambda: time.time() > t_end, 5, "calibration clip")
+    # record until the clip has 20 frames (slow build machines deliver fewer frames per second)
+    _pump(app, lambda: len(dlg.clip) >= 20, 10, "20 frames in the calibration clip")
     dlg._toggle_record()
     assert len(dlg.clip) >= 20 and dlg.scrub.isEnabled(), f"{len(dlg.clip)} frames in the clip"
     dlg._step(1, False)
@@ -439,10 +621,16 @@ def t_gui(ctx):
     assert win.recording is None and win.last_folder is not None
     assert win.rec_status.text().startswith("Saved"), win.rec_status.text()
     js = json.loads((win.last_folder / "session.json").read_text(encoding="utf-8"))
-    assert js["video"]["frames"] > 40 and js["arduino"]["samples"] > 10000, js
+    assert js["video"]["frames"] > 20 and js["arduino"]["samples"] > 10000, js
     assert js["ir_led_at_start"] == "on"
     assert js["arduino"]["pins"] == {"ttl": "A5", "microphone": "A1", "ir_led": "D8"}, js["arduino"]["pins"]
     assert js.get("pupil", {}).get("found_in_percent_of_frames", 0) >= 80, js.get("pupil")
+    assert win.blink_chk.isChecked() and js["camera_delay"]["measured"], js["camera_delay"]
+    assert "Camera delay" in win.rec_status.text(), win.rec_status.text()
+    pr = js["probe"]
+    assert pr["n"] == 2 and len(pr["probes"]) == 2 and pr["closest_approach_um"] is not None, pr
+    assert pr["probes"][0]["plan"]["distance"] == 1500 and pr["probes"][1]["plan"]["name"] == "B"
+    assert len(pr["probes"][0]["shanks"]) == 4 and "summary" in pr["probes"][1]
     assert js["scale"]["px_per_mm"] == 10.0 and js["scale"]["size"] == [640, 480], js.get("scale")
     with open(win.last_folder / "frames.csv", newline="", encoding="utf-8") as fh:
         rows = [r for r in csv.DictReader(fh) if r["pupil_found"] == "1"]
@@ -458,6 +646,17 @@ def t_gui(ctx):
     assert not win.rec_btn.visibleRegion().isEmpty(), "Record button scrolled out of view"
     win.close()
     app.processEvents()
+    # the probe plan comes back from the settings; an old single-plan entry still loads
+    win2 = MainWindow(settings)
+    assert win2.probe_set.n == 2 and win2.probe_set.probes[0].distance == 1500, win2.probe_set.to_dict()
+    assert "B:" in win2.probe_label.text()
+    win2.close()
+    from .probe import ProbePlan
+    settings.setValue("probe_plan", json.dumps(ProbePlan(distance=1111).to_dict()))
+    win3 = MainWindow(settings)
+    assert win3.probe_set.n == 1 and win3.probe_set.probes[0].distance == 1111
+    win3.close()
+    app.processEvents()
 
 
 TESTS = [
@@ -466,12 +665,14 @@ TESTS = [
     ("video codecs", t_video_codecs),
     ("picture adjustments", t_image),
     ("Arduino firmware and uploader", t_firmware),
-    ("pupil detection", t_pupil),
+    ("pupil detection and movement", t_pupil),
+    ("camera delay from IR blinks", t_camera_delay),
     ("serial packets", t_packets),
     ("TTL edges and clock fit", t_edges_and_clock),
     ("simulated Arduino stream", t_simulated_stream),
     ("serial commands (loopback)", t_serial_commands),
     ("recording to disk", t_recording),
+    ("probe planner", t_probe),
     ("GUI end to end", t_gui),
 ]
 

@@ -81,7 +81,9 @@ reported. Commands are documented at the top of the sketch.
    every frame and shows its outline, an enlarged close-up of the eye, an x–y trail and live traces of
    horizontal position, vertical position and diameter. **Show pupil view** hides all of that, while
    tracking and saving carry on. If the outline is too small or spills over the iris, move the
-   **Threshold** slider (the pixels counted as pupil show in red while you move it).
+   **Threshold** slider (the pixels counted as pupil show in red while you move it). Under the plots
+   a live readout says whether the eye is still or moving (and which way) and whether the pupil is
+   stable, dilating or constricting.
 7. **Calibration (optional, for millimetres):** with the camera open, click **Calibrate...** next to
    *Scale*. Hold a ruler in front of the eye, at the eye's distance from the camera, click **Record clip**,
    then **Stop**. Scrub with the slider (or the arrow keys; Shift+arrow jumps 10 frames) to a frame where
@@ -100,11 +102,11 @@ Each recording goes into its own folder, `<name>_<date>_<time>/`:
 | File | Contents |
 |---|---|
 | `video.avi` (or `.mp4`) | The camera video |
-| `frames.csv` | For every frame: `time_s`, wall clock, the matching Arduino `sample`, and with pupil tracking on `pupil_found`, `pupil_x`, `pupil_y`, `pupil_diameter`, `pupil_quality` (pixels), plus `pupil_x_mm`, `pupil_y_mm`, `pupil_diameter_mm` when a calibration is set |
-| `ttl_events.csv` | Every TTL rising and falling edge: `sample`, `time_s`, `video_frame`, `frame_time_s` |
+| `frames.csv` | For every frame: `time_s`, `time_exposure_s` (when the camera delay was measured, see *IR sync blinks*), wall clock, the matching Arduino `sample`, `brightness` (mean grey level). With pupil tracking on: `pupil_found`, `pupil_x`, `pupil_y`, `pupil_diameter`, `pupil_quality` (pixels; plus `pupil_x_mm`, `pupil_y_mm`, `pupil_diameter_mm` with a calibration), then `pupil_minor`, `eye_speed_px_s`, `eye_moving`, `pupil_change_pct_s`, `pupil_state` (plus `pupil_minor_mm`, `eye_speed_mm_s`) |
+| `ttl_events.csv` | Every TTL rising and falling edge: `sample`, `time_s`, `video_frame`, `frame_time_s`; with a measured camera delay also `video_frame_exposure`, `frame_exposure_time_s` (the frame *exposed* at that moment) |
 | `microphone.wav` | The microphone, centred and amplified so you can listen to it |
 | `analog.wav` | 3 channels at the sample rate, raw values: TTL (0–1023), microphone (0–1023), IR LED (0/1) |
-| `session.json` | Settings (including pins, picture adjustments and the calibration with how and when it was measured), measured frame rate, Arduino clock fit, drop counts |
+| `session.json` | Settings (including pins, picture adjustments and the calibration with how and when it was measured), measured frame rate, Arduino clock fit, drop counts, `camera_delay` (per-blink values, median, spread), `probe` (the probe plan, see below) |
 
 All `time_s` values are seconds since **Record** was pressed, on the computer's clock.
 Arduino sample *n* happened at `first_sample_time_s + n / measured_rate_hz` (both in `session.json`).
@@ -125,22 +127,106 @@ To line up with the Neuropixels, match the TTL edges in `ttl_events.csv` to the 
 in Open Ephys / SpikeGLX (they are the same pulses), then read off the video frame or the
 sound sample for any Neuropixels time.
 
-Frame times are when each frame reached the computer, which is a little after its exposure
-(typically one or two frame intervals for USB cameras). If you need alignment to better than a
-frame or two, measure this delay once for your camera, for example by filming an LED that the
-TTL switches.
+Frame times (`time_s`) are when each frame reached the computer, which is a little after its exposure
+(typically one or two frame intervals for USB cameras). With the IR LED on, SyncCam measures this
+delay in every recording with **IR sync blinks** (below) and writes exposure-corrected frame times,
+`time_exposure_s`. Use those, and `video_frame_exposure` in `ttl_events.csv`, when you need the
+video lined up with the TTL to better than a frame or two.
+
+### IR sync blinks (camera delay)
+
+**IR sync blinks at start and end** (IR LED panel, on by default) works whenever the IR LED is on and
+both the camera and the Arduino are connected. About 0.5 s after **Record**, and again just before the
+recording ends, the IR LED goes off for 0.1 s, so the picture dims for about three frames. The
+recording ends 0.5 s after the second blink (Stop takes about 0.6 s longer).
+
+The Arduino records the exact moments the LED went off and on (`analog.wav` channel 3, on the same
+clock as the TTL). For each of the 4 transitions, SyncCam takes the first frame whose brightness
+crosses halfway between the normal level and the dip, and computes
+**delay = frame time − LED edge time**. The median is the camera delay:
+
+- `session.json → camera_delay`: the per-blink values, `delay_ms` (median), `delay_spread_ms`, and the frame interval;
+- `frames.csv`: `time_exposure_s = time_s − delay`, plus the `brightness` of every frame it was measured from;
+- the status line after Stop shows it, for example "Camera delay 48 ms (spread 6 ms)".
+
+The delay is known to about ± half a frame: a frame shows the change somewhere within its exposure,
+and the first frame showing it can arrive up to one frame interval after the true delay. If
+switching the LED off does not visibly darken the picture (an IR LED that is not the camera's
+light), the recording says *no visible dip* instead of guessing, and `time_exposure_s` is not written.
+The method comes from VisRig (`visrig/camsync.py`, `_ir_blink`).
 
 ### Pupil tracking
 
-The pupil is found by contrast: inside the eye box SyncCam looks for the darkest round blob, tries a
-range of thresholds and keeps the one where the blob's outline is most stable (the pupil's sharp edge),
-then fits an ellipse to its convex outline. This handles small and fully dilated pupils, the lower lid
-cutting into the pupil, and small reflections. `pupil_diameter` is the long axis of the ellipse in image
-pixels; `pupil_x` / `pupil_y` are the centre in image pixels. Blinks and frames where the pupil cannot be
-seen give `pupil_found = 0` and empty values, never a guess. `pupil_quality` (0–1) combines roundness and
-contrast; frames below 0.2 are already rejected. Detection takes 1–2 ms per frame, so it does not slow
-the camera down. It works on the original camera image, so the brightness/contrast sliders do not
-change the measurement.
+The detector is VisRig's (`visrig/pupil/detector.py`), with one change. Inside the eye box it blurs
+the picture (5 px) and takes everything darker than the darkest 0.2 % of the box plus an offset (20 grey
+levels; the **Threshold** slider moves the offset) as possible pupil. A 5 px opening cuts thin bridges to
+the dark iris edge or lashes. Among the dark blobs it picks the one with the best roundness × solidity ×
+ellipse fill × √area, preferring blobs near the last pupil position, and fits an ellipse to the blob's
+convex hull. That way a lid notch or the corneal reflection doesn't bite into the outline. The
+*confidence* (roundness × solidity × ellipse fill; a clear pupil gives about 0.9) must be at least
+0.6, otherwise the frame counts as lost (blink, half-closed lid, fur): `pupil_found = 0` and empty
+values, never a guess. `pupil_quality` is that confidence.
+
+*The change:* only blobs above the confidence limit compete. In VisRig a low-confidence blob near a
+wrongly remembered position could win, the frame was then rejected and the remembered position never
+updated. On the rig's eye video one dark speck in the fur locked VisRig's detector for about 3,000
+frames while the pupil was clearly visible.
+
+On that video (`pupil_video2025-12-08T15_59_24.avi`, 55,872 frames, eye box 340,160,160,130):
+
+| | pupil found | diameter jumps > 3 px | per frame |
+|---|---|---|---|
+| previous SyncCam tracker | 99.2 % | 1,310 | 2.4 ms |
+| VisRig detector | 94.0 % | 35 | 0.37 ms |
+| SyncCam now | 99.5 % | 58 | 0.47 ms |
+
+Where both find a pupil, the centre is the same as VisRig's (0.000 px median difference). Of the 197
+frames where they differ by more than 5 px, 190 are VisRig on the fur speck.
+
+**Diameter:** `pupil_diameter` is the ellipse's **long axis**. The camera looks at the eye from an
+angle, so a round pupil appears as an ellipse whose long axis is its true diameter and whose short axis
+is foreshortened (and cut by the lower lid when the pupil is large). VisRig reports √(long × short),
+which reads smaller and changes with gaze direction. On the video above the long axis was also steadier
+(58 against 77 jumps over 3 px). `pupil_minor` is the short axis, so VisRig's value is
+`sqrt(pupil_diameter × pupil_minor)` if you need to compare with VisRig data.
+
+**Movement and dilation** (VisRig's Kinematics): `eye_speed_px_s` is the speed of the pupil centre over
+the last 0.2 s, and `eye_moving` is `still` below 20 px/s, otherwise the direction (`right`, `up-left`, …,
+image directions). `pupil_change_pct_s` is the diameter's slope over the last 1.0 s in % per second, and
+`pupil_state` is `dilating` / `constricting` beyond ±8 %/s, otherwise `stable`. Both are `lost` while
+the pupil is not found. The thresholds were calibrated on the video above, where the eye was moving in
+0.4 % of frames and the pupil was dilating or constricting in about 11 % each.
+
+Detection takes about 0.5 ms per frame and works on the original camera image, so the
+brightness / contrast sliders do not change the measurement. Positions and sizes are in image pixels;
+with a calibration the `_mm` columns give millimetres.
+
+### Probe planner (Tools → Probe…)
+
+An angled Neuropixels insertion calculator with a simple Pinpoint-style view - the same as in VisRig, for **one or two
+probes** in the same mouse. Coordinates are stereotaxic, relative to bregma, in µm: AP + anterior, ML + right, DV + down.
+
+- Per probe: entry AP/ML, brain surface DV at the entry, angle from horizontal (90 = straight down), direction seen
+  from above (0 anterior, 90 right, 180 posterior, 270 left), shank-plane roll and the **distance travelled** (the
+  manipulator readout). The results card gives depth = distance·sin(angle), horizontal travel = distance·cos(angle),
+  the depth of the lowest site, and the tip of every shank (check: 45°, 1230.37 µm → 870 µm deep, 870 µm across).
+- *Plan to a target* sets the entry point and distance that bring the probe's centre line to a target AP/ML/DV,
+  keeping the angles and the surface depth.
+- Probe presets: NP2.0 4-shank, NP2.0 1-shank, NP1.0, 2 shanks (any edit → Custom). The tip-to-lowest-site
+  lengths are placeholders - check the probe datasheet.
+- **Two probes**: probe B starts as A mirrored to the other hemisphere. The card shows the closest approach
+  between any shank of A and any shank of B (inside the brain); below 300 µm it turns red ("probes may touch").
+- Views: coronal, sagittal and top, with a 1 mm grid, bregma, the recorded span of every shank as a thick coloured
+  bar, the targets as red ×, and the spreadsheet table (mode 2) of the active probe.
+- **Allen atlas** (optional): *Load Allen atlas* downloads the CCF 2017 25 µm annotation and the structure list once
+  (asks first) into the per-user settings folder (`%APPDATA%\SyncCam\atlas`, `~/Library/Application Support/SyncCam/atlas`).
+  Then the coronal and sagittal views show the atlas slice through the active probe's tips, and the card gives
+  the region of every tip and the regions along the recorded span. Bregma is placed at CCF (5400, 332, 5739) µm
+  with no stereotaxic scaling, so treat regions near borders as approximate.
+
+The plan is remembered between sessions, summarised under the Record button, and written into every
+`session.json` as `probe`: `n`, and for each probe the plan, a summary, the tip of every shank (plus the atlas
+regions if the atlas is loaded), and `closest_approach_um`.
 
 ## Limits
 

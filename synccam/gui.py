@@ -24,7 +24,8 @@ from .arduino import (ANALOG_PINS, DEFAULT_PINS, IR_OFF, IR_ON, IR_PINS, SAMPLE_
                       ArduinoStream, SimulatedArduino, list_serial_ports, make_arduino)
 from .camera import (CODECS, RESOLUTIONS, TEST_PATTERN, CameraThread, ImageSettings, auto_levels,
                      scan_cameras)
-from .pupil import PupilParams, PupilTracker
+from .probe import ProbeSet
+from .pupil import Kinematics, PupilParams, PupilTracker
 from .session import Recording
 
 APP_ID = "io.github.jerjely.SyncCam"
@@ -843,6 +844,9 @@ class MainWindow(QMainWindow):
     def __init__(self, settings: Optional[QSettings] = None):
         super().__init__()
         self.settings = settings if settings is not None else QSettings("jerjely", APP_NAME)
+        self.probe_set = ProbeSet()
+        self.probe_window = None
+        self.probe_atlas_folder = None        # None = the per-user config folder
         self.camera: Optional[CameraThread] = None
         self.scale: Optional[dict] = None       # {"px_per_mm", "size", "set", "method"}
         self.stream: Optional[ArduinoStream] = None
@@ -1019,6 +1023,13 @@ class MainWindow(QMainWindow):
         v.addWidget(self.ir_btn)
         self.ir_btn.setToolTip("Switched by the Arduino. It stays as you set it until you switch it "
                                "or disconnect.")
+        self.blink_chk = QCheckBox("IR sync blinks at start and end")
+        self.blink_chk.setChecked(True)
+        self.blink_chk.setToolTip("With the IR LED on: 0.5 s after Record and just before Stop, the IR LED goes off "
+                                  "for 0.1 s. From the dimmed frames and the Arduino-recorded LED moments SyncCam "
+                                  "measures the camera delay and saves exposure-corrected frame times "
+                                  "(time_exposure_s in frames.csv).")
+        v.addWidget(self.blink_chk)
         left.addWidget(box)
 
         # 4 recording
@@ -1051,6 +1062,11 @@ class MainWindow(QMainWindow):
         self.rec_status.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
         self.rec_status.setMinimumHeight(3 * self.rec_status.fontMetrics().lineSpacing() + 4)
         v.addWidget(self.rec_status)
+        self.probe_label = QLabel()
+        self.probe_label.setStyleSheet("color: #4a5568;")
+        self.probe_label.setToolTip("Probe plan saved into session.json (Tools > Probe...)")
+        self.probe_label.setWordWrap(True)
+        v.addWidget(self.probe_label)
         box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         left_col.addWidget(box, 0)
         left.addStretch(1)
@@ -1120,6 +1136,12 @@ class MainWindow(QMainWindow):
         self.pupil_plot = PupilPlot()
         self.pupil_plot.on_wheel = self._pupil_wheel
         v.addWidget(self.pupil_plot)
+        self.pupil_state = QLabel()
+        self.pupil_state.setTextFormat(Qt.TextFormat.RichText)
+        self.pupil_state.setToolTip("Eye movement from the pupil centre's speed over the last 0.2 s (moving above "
+                                    "20 px/s); pupil from its diameter trend over the last 1 s (dilating or "
+                                    "constricting beyond 8 % per second). Saved per frame in frames.csv.")
+        v.addWidget(self.pupil_state)
         self.pupil_box.setVisible(False)
         right.addWidget(self.pupil_box, 0)
 
@@ -1205,6 +1227,11 @@ class MainWindow(QMainWindow):
         a = QAction("Save sketch (.ino) for the Arduino IDE...", self)
         a.triggered.connect(self._save_sketch)
         am.addAction(a)
+        tm = self.menuBar().addMenu("&Tools")
+        a = QAction("Probe...", self)
+        a.setToolTip("Angled Neuropixels insertion planner (one or two probes) with an atlas view")
+        a.triggered.connect(self.show_probe_planner)
+        tm.addAction(a)
         h = self.menuBar().addMenu("&Help")
         a = QAction(f"About {APP_NAME}", self)
         a.setMenuRole(QAction.MenuRole.AboutRole)
@@ -1212,8 +1239,38 @@ class MainWindow(QMainWindow):
         h.addAction(a)
 
     # ---- settings ----------------------------------------------------------
+    # ---- probe planner -----------------------------------------------------
+    def show_probe_planner(self):
+        if self.probe_window is None:
+            from .probe_gui import ProbePlannerWindow
+            self.probe_window = ProbePlannerWindow(self.probe_set, APP_NAME, self,
+                                                   atlas_folder=self.probe_atlas_folder)
+            self.probe_window.changed.connect(self._probe_changed)
+        self.probe_window.show()
+        self.probe_window.raise_()
+        self.probe_window.activateWindow()
+        return self.probe_window
+
+    def _probe_atlas(self):
+        return self.probe_window.atlas if self.probe_window is not None else None
+
+    def _probe_changed(self) -> None:
+        if self.probe_window is not None:
+            self.probe_set = self.probe_window.pset
+        text = "\n".join("Probe " + p.summary() for p in self.probe_set.used)
+        ca = self.probe_set.closest_approach()
+        if ca is not None:
+            text += f"  ·  closest A–B {ca:.0f} µm"
+        self.probe_label.setText(text)
+        self.probe_label.setToolTip(text + "\nSaved into session.json at every recording (Tools > Probe...)")
+        self.settings.setValue("probe_plan", self.probe_set.to_json())
+
     def _restore_settings(self) -> None:
         s = self.settings
+        self.probe_set = ProbeSet.from_json(str(s.value("probe_plan", "") or ""))
+        if self.probe_window is not None:
+            self.probe_window.set_probe_set(self.probe_set)
+        self._probe_changed()
 
         def pick(combo, key):
             val = s.value(key)
@@ -1231,6 +1288,7 @@ class MainWindow(QMainWindow):
         pick(self.mic_pin, "mic_pin")
         pick(self.ir_pin, "ir_pin")
         self.ir_btn.setChecked(str(s.value("ir_on", "false")).lower() == "true")
+        self.blink_chk.setChecked(str(s.value("ir_blinks", "true")).lower() == "true")
         for spin, key, cast in ((self.fps_spin, "fps", int), (self.thr_spin, "threshold", float)):
             val = s.value(key)
             if val is not None:
@@ -1280,6 +1338,7 @@ class MainWindow(QMainWindow):
 
     def _save_settings(self) -> None:
         s = self.settings
+        s.setValue("probe_plan", self.probe_set.to_json())
         s.setValue("resolution", str(self.res_combo.currentData()))
         s.setValue("codec", self.codec_combo.currentData())
         s.setValue("rate", self.rate_combo.currentData())
@@ -1287,6 +1346,7 @@ class MainWindow(QMainWindow):
         s.setValue("mic_pin", self.mic_pin.currentData())
         s.setValue("ir_pin", self.ir_pin.currentData())
         s.setValue("ir_on", self.ir_btn.isChecked())
+        s.setValue("ir_blinks", self.blink_chk.isChecked())
         s.setValue("fps", self.fps_spin.value())
         s.setValue("threshold", self.thr_spin.value())
         s.setValue("folder", self.dir_edit.text())
@@ -1336,10 +1396,11 @@ class MainWindow(QMainWindow):
                                 + (" and camera permission in System Settings > Privacy & Security."
                                    if sys.platform == "darwin" else "."))
 
-    def _led_fn(self):
+    def _led_fn(self, t=None):
+        """IR LED state for the test-pattern camera (at computer time t, if given)."""
         st = self.stream
         if st is not None and isinstance(st.device, SimulatedArduino):
-            return st.device.current_led()
+            return st.device.led_at(t) if t is not None else st.device.current_led()
         return bool(st.last_led) if st is not None else False
 
     def _toggle_camera(self) -> None:
@@ -1471,11 +1532,13 @@ class MainWindow(QMainWindow):
             if on:
                 if cam.pupil_tracker is None:
                     cam.pupil_log.clear()
+                    cam.pupil_kin = Kinematics()
                     cam.pupil_tracker = PupilTracker(self._pupil_params())
                 else:
                     cam.pupil_tracker.set_params(self._pupil_params())
             else:
                 cam.pupil_tracker = None
+                cam.pupil_kin = None
         self._pupil_view_changed()
 
     def _pupil_toggled(self, *_a) -> None:
@@ -1493,6 +1556,8 @@ class MainWindow(QMainWindow):
     def _eye_box_drawn(self, box) -> None:
         if self.camera is not None:
             self.camera.pupil_log.clear()
+            if self.camera.pupil_kin is not None:
+                self.camera.pupil_kin = Kinematics()
         self._pupil_params_changed()
 
     def _pupil_params_changed(self, *_a) -> None:
@@ -1503,6 +1568,27 @@ class MainWindow(QMainWindow):
             self._mask_until = time.time() + 2.5
         if self.recording is not None:
             self.recording.pupil_changed = True
+
+    def _kin_text(self, kin) -> str:
+        if not kin:
+            return '<span style="color:#8a93ad">Eye: -    Pupil: -</span>'
+        k_mm = self.pupil_plot.px_per_mm
+        mv, st = kin.get("moving", ""), kin.get("size", "")
+        sp, dd = kin.get("speed", float("nan")), kin.get("dd_pct", float("nan"))
+        if mv == "lost":
+            return '<span style="color:#a32035"><b>Pupil not found</b> (blink, closed eye or out of the box)</span>'
+        if mv in ("", "still"):
+            eye = '<span style="color:#1a7a3a"><b>Eye still</b></span>' if mv else "Eye: ..."
+        else:
+            speed = (f"{sp / k_mm:.2f} mm/s" if k_mm else f"{sp:.0f} px/s") if np.isfinite(sp) else ""
+            eye = f'<span style="color:#2f46d9"><b>Eye moving {mv}</b></span> ({speed})'
+        colours = {"dilating": "#d98a00", "constricting": "#7a4cff", "stable": "#1a7a3a"}
+        if st in colours:
+            rate = f" ({dd:+.1f} %/s)" if np.isfinite(dd) else ""
+            pupil = f'<span style="color:{colours[st]}"><b>Pupil {st}</b></span>{rate}'
+        else:
+            pupil = "Pupil: ..."
+        return f"{eye}&nbsp;&nbsp;&nbsp;&nbsp;{pupil}"
 
     def _pupil_wheel(self, step: int) -> None:
         w = PupilPlot.WINDOWS
@@ -1737,10 +1823,16 @@ class MainWindow(QMainWindow):
         extra = {"name": self.name_edit.text(),
                  "ir_led_at_start": "on" if self.ir_btn.isChecked() else "off"}
         try:
+            extra["probe"] = self.probe_set.session_block(self._probe_atlas())
+        except Exception as exc:                      # never block a recording because of the plan
+            extra["probe"] = {"error": str(exc)}
+        try:
             Path(self.dir_edit.text()).mkdir(parents=True, exist_ok=True)
             rec = Recording(self.dir_edit.text(), self.name_edit.text(), self.camera, self.stream,
                             self.codec_combo.currentData(), self._threshold_adc(), extra,
-                            adjust_video=self.adjust_rec_chk.isChecked(), scale=self._valid_scale())
+                            adjust_video=self.adjust_rec_chk.isChecked(), scale=self._valid_scale(),
+                            ir_blinks=(self.blink_chk.isChecked() and self.ir_btn.isChecked()
+                                       and self.camera is not None and self.stream is not None))
             rec.start()
         except Exception as exc:
             QMessageBox.critical(self, "Cannot start recording", str(exc))
@@ -1755,6 +1847,9 @@ class MainWindow(QMainWindow):
         if rec is None:
             return None
         self.view.recording = False
+        if rec.ir_blinks:
+            self.rec_status.setText("Finishing: IR sync blink...")
+            QApplication.processEvents()
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             info = rec.stop()
@@ -1774,6 +1869,11 @@ class MainWindow(QMainWindow):
             a = info["arduino"]
             bits.append(f"{a['samples']} samples, {info.get('ttl_rising_edges', 0)} TTL pulses"
                         + (f", {a['samples_lost_and_filled']} samples lost" if a["samples_lost_and_filled"] else ""))
+        cd = info.get("camera_delay") or {}
+        if cd.get("measured"):
+            bits.append(f"Camera delay {cd['delay_ms']:.0f} ms (spread {cd['delay_spread_ms']:.0f} ms)")
+        elif rec.ir_blinks and cd.get("reason"):
+            bits.append(f"Camera delay not measured: {cd['reason']}")
         self.rec_status.setStyleSheet("color: #1a7a3a;")
         self.rec_status.setText("\n".join(bits))
         self._update_enabled()
@@ -1798,6 +1898,7 @@ class MainWindow(QMainWindow):
                     cam.pupil_want_mask = False
                 self.view.mask = f.pupil.mask if (f.pupil is not None and cam.pupil_want_mask) else None
                 if cam.pupil_tracker is not None and self.pupil_box.isVisible():
+                    self.pupil_state.setText(self._kin_text(f.kin))
                     self.pupil_plot.set_closeup(f.raw if f.raw is not None else f.image,
                                                 cam.pupil_tracker.params.box, f.pupil)
                     self.pupil_plot.set_data(list(cam.pupil_log))
@@ -1864,6 +1965,7 @@ class MainWindow(QMainWindow):
             self.ard_status.setText('<span style="color:#8a93ad">&#9679;</span> Not connected')
             self.sig_label.setText("")
         self.thr_spin.setEnabled(not rec)
+        self.blink_chk.setEnabled(not rec)
         self.grey_chk.setEnabled(not rec)
         self.pupil_chk.setEnabled(not rec)
         self.adjust_rec_chk.setEnabled(not rec)

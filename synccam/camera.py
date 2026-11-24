@@ -65,8 +65,12 @@ def scan_cameras(max_index: int = 6) -> List[Tuple[int, str]]:
 class TestPatternSource:
     """Synthetic camera: moving bar, frame counter, and an 'IR LED' spot.
 
-    `led_fn` returns the current LED state; the spot at LED_RECT is bright when on.
+    `led_fn(t)` returns the IR LED state at computer time t; the spot at LED_RECT is bright when
+    on. With `ir_scene` the whole picture is lit by the IR LED (it dims to half when the LED is
+    off), and what is shown is the LED state `delay_s` earlier, like a real camera whose frames
+    reach the computer some time after their exposure (used to test the IR sync blinks).
     """
+    SIM_DELAY_S = 0.050
     LED_RECT = (40, 40, 40, 40)      # x, y, w, h
     RULER_PX_PER_MM = 10.0           # the test ruler: one mark per mm
     RULER_ORIGIN = (40, 420)         # x, y of its 0 mm mark
@@ -119,15 +123,19 @@ class TestPatternSource:
         img[eye > 0] = iris[eye > 0]
         cv2.ellipse(img, (cx, cy), (60, 32), 0, 200, 340, (215, 215, 215), 2)    # bright upper lid rim
 
-    def __init__(self, size=(640, 480), fps: float = 30.0, led_fn: Optional[Callable[[], bool]] = None):
+    def __init__(self, size=(640, 480), fps: float = 30.0, led_fn: Optional[Callable] = None,
+                 ir_scene: bool = False, delay_s: float = SIM_DELAY_S):
         self.w, self.h = size
         self.fps = fps
-        self.led_fn = led_fn or (lambda: False)
+        self.led_fn = led_fn or (lambda t=None: False)
+        self.ir_scene = ir_scene
+        self.delay_s = delay_s
         self._n = 0
         self._next = time.perf_counter()
         yy, xx = np.mgrid[0:self.h, 0:self.w]
         self._bg = ((xx * 60 // max(1, self.w)) + (yy * 40 // max(1, self.h)) + 30).astype(np.uint8)
-        self._rng = np.random.default_rng(0)
+        rng = np.random.default_rng(0)
+        self._noise = [rng.integers(-6, 7, (self.h, self.w), dtype=np.int16) for _ in range(6)]
 
     def isOpened(self) -> bool:
         return True
@@ -141,11 +149,14 @@ class TestPatternSource:
         x = int((self._n * 6) % self.w)
         img[:, max(0, x - 6):x + 6] = (90, 160, 90)
         x0, y0, w, h = self.LED_RECT
-        img[y0:y0 + h, x0:x0 + w] = 250 if self.led_fn() else 20
+        lit = bool(self.led_fn(time.perf_counter() - self.delay_s))   # the moment this frame was exposed
+        img[y0:y0 + h, x0:x0 + w] = 250 if lit else 20
         self._draw_eye(img, self._n)
         self._draw_ruler(img)
-        noise = self._rng.integers(-6, 7, img.shape[:2], dtype=np.int16)
+        noise = self._noise[self._n % len(self._noise)]          # pre-made: cheap on slow machines
         img = np.clip(img.astype(np.int16) + noise[:, :, None], 0, 255).astype(np.uint8)
+        if self.ir_scene and not lit:
+            img = (img >> 1)                                      # IR light off: the scene dims
         try:
             cv2 = _cv2()
             cv2.putText(img, f"TEST {self._n:06d}", (self.w - 230, self.h - 20),
@@ -214,6 +225,8 @@ class Frame:
     roi_mean: float         # mean brightness in the LED ROI (nan if none)
     raw: Optional[np.ndarray] = None   # untouched camera image (BGR)
     pupil: Optional[object] = None     # PupilResult when pupil tracking is on
+    kin: Optional[dict] = None         # Kinematics output (moving / size states, speeds)
+    brightness: float = float("nan")   # mean grey level of the picture (for the IR sync blinks)
 
 
 class CameraThread:
@@ -235,6 +248,7 @@ class CameraThread:
         self._lut = self._settings.lut()
         self.pupil_tracker = None          # synccam.pupil.PupilTracker, set by the GUI
         self.pupil_want_mask = False       # keep the dark-pixel mask for display (while tuning)
+        self.pupil_kin = None              # synccam.pupil.Kinematics, set together with the tracker
         self.pupil_log: deque = deque(maxlen=30 * 120)   # (t, found, x, y, diameter): last ~2 min
         self._times: deque = deque(maxlen=120)
         self._stop = threading.Event()
@@ -243,7 +257,8 @@ class CameraThread:
 
     def open(self) -> None:
         if self.index == TEST_PATTERN:
-            self.cap = TestPatternSource(self.size_req or (640, 480), self.fps_req or 30.0, self.led_fn)
+            self.cap = TestPatternSource(self.size_req or (640, 480), self.fps_req or 30.0, self.led_fn,
+                                         ir_scene=self.led_fn is not None)
         else:
             cv2 = _cv2()
             cap = cv2.VideoCapture(self.index, backend())
@@ -328,7 +343,16 @@ class CameraThread:
                         pr = None
                     if pr is not None:
                         self.pupil_log.append((t, pr.found, pr.x, pr.y, pr.diameter))
-                frame = Frame(process_image(img, settings, lut), t, n, self._roi_mean(img), img, pr)
+                kin = None
+                kinem = self.pupil_kin
+                if pr is not None and kinem is not None:
+                    try:
+                        kin = kinem.update(t, pr)
+                    except Exception:
+                        kin = None
+                small = img[::4, ::4]                       # brightness on a 1/16 subsample: ~0.05 ms
+                frame = Frame(process_image(img, settings, lut), t, n, self._roi_mean(img), img, pr, kin,
+                              float(small.mean()))
                 n += 1
                 self._times.append(t)
                 self.latest = frame
