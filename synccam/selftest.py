@@ -336,8 +336,17 @@ def t_recording(ctx):
     assert raw[:, 0].max() > 900, "TTL missing"
     led_off = np.flatnonzero(raw[:, 2] == 0)
     off_runs = np.split(led_off, np.flatnonzero(np.diff(led_off) > 1) + 1) if len(led_off) else []
-    assert len(off_runs) == 2 and all(abs(len(r_) - 500) < 60 for r_ in off_runs), \
-        f"IR LED channel should show exactly the two 0.1 s sync blinks, got {[len(r_) for r_ in off_runs]} samples off"
+    # Two sync blinks, each as long as the computer actually kept the LED off: nominally 0.1 s
+    # (500 samples), but a stalled CI machine can oversleep - harmless, the camera delay uses the
+    # recorded LED edges.
+    rate = js["arduino"]["measured_rate_hz"]
+    commanded = [(t_on - t_off) * rate for t_off, t_on in rec.blink_cmds]
+    got = [len(r_) for r_ in off_runs]
+    assert len(off_runs) == 2 and len(commanded) == 2, \
+        f"IR LED channel should show exactly the two sync blinks, got {got} samples off ({len(commanded)} commanded)"
+    for g, c in zip(got, commanded):
+        assert g >= 450 and abs(g - c) < 60, \
+            f"IR LED off for {g} samples, the app kept it off for {c:.0f} samples (nominal 500)"
     assert js["arduino"]["samples_lost_and_filled"] == 0, f"{js['arduino']['samples_lost_and_filled']} samples lost"
     ttl = [r for r in _read_csv(folder / "ttl_events.csv") if r["edge"] == "rise"]
     assert 4 <= len(ttl) <= 7, f"{len(ttl)} TTL pulses in 3 s"
