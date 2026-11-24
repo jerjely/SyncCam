@@ -312,11 +312,27 @@ def t_recording(ctx):
     true_ms = TestPatternSource.SIM_DELAY_S * 1000
     fi = cd["frame_interval_ms"]
     assert cd["measured"] and cd["n_transitions"] == 4, cd
-    # true delay + up to one frame; a loaded CI machine adds frame-generation / scheduling lag to the
-    # time stamps (that lag is real camera delay too), so allow a second frame + 15 ms. Real bugs (wrong
-    # sign, wrong blink, wrong clock) are off by hundreds of ms.
-    assert true_ms - 5 <= cd["delay_ms"] <= true_ms + 2 * fi + 15, \
-        f"camera delay {cd['delay_ms']} ms, true {true_ms} ms, frame {fi} ms"
+    # Exact check, independent of how slow the machine is: for every LED edge the measured frame must be
+    # the first frame that could show the change (edge + simulated delay). A loaded CI machine can freeze
+    # the camera thread for 100+ ms and then make frames in a burst, so a fixed limit on the delay
+    # itself does not work there; what must hold is that no frame was skipped and none taken too early.
+    ft_all = np.array([float(r["time_s"]) for r in frames])
+    slack = 0.030                      # LED state is read while the frame is drawn, a little before its time stamp
+    for b in cd["blinks"]:
+        for edge_key, d_key in (("t_off_s", "off_delay_ms"), ("t_on_s", "on_delay_ms")):
+            edge, d = b[edge_key], b[d_key] / 1000.0
+            change = edge + true_ms / 1000.0
+            i = int(np.argmin(np.abs(ft_all - (edge + d))))
+            assert abs(ft_all[i] - (edge + d)) < 1e-4, f"{d_key}: no frame at the measured time ({b})"
+            assert ft_all[i] >= change - 0.005, \
+                f"{d_key} {d * 1000:.1f} ms: frame taken before the simulated {true_ms:.0f} ms delay ({b})"
+            assert i == 0 or ft_all[i - 1] < change + slack, \
+                f"{d_key} {d * 1000:.1f} ms: frame {i - 1} at +{(ft_all[i - 1] - edge) * 1000:.1f} ms " \
+                f"should already have shown the change ({b})"
+    gap = max(float(np.max(np.diff(ft_all[(ft_all > b["t_off_s"] - 0.1) & (ft_all < b["t_on_s"] + 0.6)])))
+              for b in cd["blinks"])
+    assert true_ms - 5 <= cd["delay_ms"] <= true_ms + gap * 1000 + slack * 1000, \
+        f"camera delay {cd['delay_ms']} ms, true {true_ms} ms, longest frame gap {gap * 1000:.0f} ms"
     r_ = frames[len(frames) // 2]
     assert abs(float(r_["time_s"]) - float(r_["time_exposure_s"]) - cd["delay_ms"] / 1000) < 1e-5
     with open(folder / "ttl_events.csv", newline="", encoding="utf-8") as fh:
