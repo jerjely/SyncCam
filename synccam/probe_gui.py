@@ -259,6 +259,8 @@ class ProbePlannerWindow(QWidget):
             b = QPushButton(str(n))
             b.setCheckable(True)
             b.setFixedWidth(40)
+            b.setStyleSheet("QPushButton:checked { background: #3b4fd8; color: white; border: 1px solid #2f3fb0;"
+                            " font-weight: bold; }")
             self.n_group.addButton(b, n)
             self.n_btns.append(b)
             row.addWidget(b)
@@ -492,7 +494,8 @@ class ProbePlannerWindow(QWidget):
         for pi, plan in enumerate(self.pset.used):
             r = plan.readouts()
             head = f"<b>Probe {plan.name}</b> &nbsp;" if self.pset.n == 2 else ""
-            parts.append(f"<div style='margin-bottom:6px'>{head}depth <b>{r['depth_below_surface_um']:.0f} µm</b>"
+            top = "margin-top:8px; " if pi else ""
+            parts.append(f"<div style='{top}margin-bottom:4px'>{head}depth <b>{r['depth_below_surface_um']:.0f} µm</b>"
                          f" · horizontal {r['horizontal_travel_um']:.0f} µm"
                          f" · lowest site {r['lowest_site_depth_um']:.0f} µm deep</div>")
             for i, tip in enumerate(plan.tips()):

@@ -159,7 +159,7 @@ class TestPatternSource:
             img = (img >> 1)                                      # IR light off: the scene dims
         try:
             cv2 = _cv2()
-            cv2.putText(img, f"TEST {self._n:06d}", (self.w - 230, self.h - 20),
+            cv2.putText(img, f"TEST {self._n:06d}", (14, self.h - 14),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
         except Exception:
             pass

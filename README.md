@@ -14,7 +14,22 @@ sample, so video, sound and the Neuropixels recording line up through the shared
 
 Windows 10/11 and macOS (Apple silicon and Intel).
 
-![SyncCam while recording](docs/screenshots/3_recording.png)
+![SyncCam with pupil tracking, the TTL, microphone and IR LED](docs/screenshots/2_live.png)
+
+<table>
+<tr>
+<td width="50%"><img src="docs/screenshots/3_recording.png" alt="Recording"><br><sub><b>Recording</b>: video, TTL, sound and IR LED on one clock</sub></td>
+<td width="50%"><img src="docs/screenshots/4_saved.png" alt="Saved recording"><br><sub><b>Saved</b>: frames, TTL pulses and the measured camera delay</sub></td>
+</tr>
+<tr>
+<td><img src="docs/screenshots/5_pupil.png" alt="Pupil tracking"><br><sub><b>Pupil tracking</b>: close-up, x–y trail, position and diameter in mm</sub></td>
+<td><img src="docs/screenshots/7_signals_zoom.png" alt="Zoomed signals"><br><sub><b>Zoomed signals</b>: a TTL pulse and the sound burst it gates</sub></td>
+</tr>
+<tr>
+<td><img src="docs/screenshots/6_calibration.png" alt="Calibration"><br><sub><b>Calibration</b>: record a clip of a ruler, scrub, click a known distance</sub></td>
+<td><img src="docs/screenshots/8_probe_planner.png" alt="Probe planner"><br><sub><b>Probe planner</b>: two angled Neuropixels probes, coronal / sagittal / top views</sub></td>
+</tr>
+</table>
 
 ## Download
 
