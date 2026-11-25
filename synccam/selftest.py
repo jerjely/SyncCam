@@ -673,6 +673,23 @@ def t_gui(ctx):
     for b in (win.rec_btn, win.cam_btn, win.ard_btn, win.ir_btn):
         assert b.height() >= b.minimumSizeHint().height() - 1, f"{b.text()} squashed to {b.height()} px"
     assert not win.rec_btn.visibleRegion().isEmpty(), "Record button scrolled out of view"
+    # ... and with the pupil view open (it needs the most height): the right-hand groups never
+    # overlap or get squashed; on a short window pupil and signals go side by side
+    win.pupil_show_chk.setChecked(True)
+    for size, side_by_side in (((1100, 560), True), ((1300, 1000), False)):
+        win.resize(*size)
+        t_end = time.time() + 0.4
+        _pump(app, lambda: time.time() > t_end, 2, "resize")
+        boxes = (win.preview_box, win.pupil_box, win.signals_box)
+        assert all(b.isVisible() for b in boxes)
+        for b in boxes:
+            assert b.height() >= b.minimumSizeHint().height() - 1, f"{b.title()} squashed at {size}"
+        rects = [b.geometry() for b in boxes]
+        for i in range(3):
+            for j in range(i + 1, 3):
+                assert not rects[i].intersects(rects[j]), f"{boxes[i].title()} overlaps {boxes[j].title()} at {size}"
+        horizontal = win.bottom_row.direction().name == "LeftToRight"
+        assert horizontal == side_by_side, f"pupil/signals side by side = {horizontal} at {size}"
     win.close()
     app.processEvents()
     # the probe plan comes back from the settings; an old single-plan entry still loads

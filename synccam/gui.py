@@ -9,10 +9,10 @@ from typing import Optional
 
 import numpy as np
 from PySide6 import QtCore
-from PySide6.QtCore import QPointF, QRectF, QSettings, Qt, QTimer, QUrl
+from PySide6.QtCore import QEvent, QPointF, QRectF, QSettings, Qt, QTimer, QUrl
 from PySide6.QtGui import (QAction, QColor, QDesktopServices, QIcon, QImage, QKeySequence,
                            QPainter, QPalette, QPen, QPixmap, QPolygonF)
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+from PySide6.QtWidgets import (QApplication, QBoxLayout, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QDoubleSpinBox, QFileDialog,
                                QFormLayout, QFrame, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
                                QMainWindow, QMessageBox, QProgressDialog, QPushButton, QScrollArea,
@@ -105,7 +105,7 @@ class VideoView(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumSize(400, 150)
+        self.setMinimumSize(400, 120)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._img: Optional[QImage] = None
         self._arr = None
@@ -246,11 +246,13 @@ class VideoView(QWidget):
 # --------------------------------------------------------------------------
 class PupilPlot(QWidget):
     """Live pupil view: x-y trail on the left, x / y / diameter traces on the right."""
+    TRACE_MIN = 120                # px kept for the traces when the panel is narrow
     WINDOWS = [5.0, 10.0, 30.0, 60.0, 120.0]
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumHeight(120)
+        self.setMinimumHeight(96)
+        self.setMinimumWidth(280)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.data = np.zeros((0, 5))       # t, found, x, y, diameter
         self.window_s = 10.0
@@ -301,9 +303,18 @@ class PupilPlot(QWidget):
         H = self.height()
         side = H - 16
         x_left = 10
-        if self._close is not None:                     # eye close-up first
+        # narrow (panels side by side): the traces keep at least TRACE_MIN px; the close-up shrinks
+        # first, then goes, then the x-y square shrinks
+        room = self.width() - 20 - 92 - self.TRACE_MIN
+        cw = 0.0
+        if self._close is not None:
+            _qi, _b, (bx0, by0, bw0, bh0), _pr = self._close
+            cw = min(side * bw0 / max(bh0, 1), side * 2.2, max(0.0, room - side - 10))
+            if cw < 70:
+                cw = 0.0
+        tside = max(50.0, min(side, room - (cw + 10 if cw else 0)))
+        if self._close is not None and cw > 0:          # eye close-up first
             qi, _buf, (bx, by, bw, bh), pr = self._close
-            cw = min(side * bw / max(bh, 1), side * 2.2)
             ch = cw * bh / max(bw, 1)
             cr = QRectF(x_left, 8 + (side - ch) / 2, cw, ch)
             p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
@@ -321,7 +332,8 @@ class PupilPlot(QWidget):
                 p.setPen(QColor("#ff4d6a"))
                 p.drawText(cr, int(Qt.AlignmentFlag.AlignCenter), "not found")
             x_left = cr.right() + 10
-        sq = QRectF(x_left, 8, side, side)
+        side = tside
+        sq = QRectF(x_left, 8 + (H - 16 - side) / 2, side, side)
         p.setPen(QPen(QColor("#e6e9f3"), 1))
         p.setBrush(QColor("#ffffff"))
         p.drawRect(sq)
@@ -416,7 +428,7 @@ class ScopeWidget(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumHeight(135)
+        self.setMinimumHeight(110)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.data = np.zeros((0, 3), dtype=np.int16)
         self.fs = 5000
@@ -857,6 +869,9 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1000, 540)
         self.resize(*self._fitting_size(1240, 800))
         self._build_ui()
+        # no horizontal scrolling on the right: keep the window at least as wide as its content
+        self.right_scroll.setMinimumWidth(self._right_panel.minimumSizeHint().width()
+                                          + self.right_scroll.verticalScrollBar().sizeHint().width())
         self._build_menu()
         self._restore_settings()
         self.refresh_ports()
@@ -907,10 +922,25 @@ class MainWindow(QMainWindow):
         left_col = QVBoxLayout()
         left_col.setSpacing(6)
         left_col.addWidget(self.left_scroll, 1)
-        right = QVBoxLayout()
+        # The right column scrolls too: with the pupil view open it needs more height than a
+        # laptop at 125-150 % scaling has, and Qt would otherwise draw the groups over each other.
+        right_panel = QWidget()
+        right_panel.setObjectName("rightPanel")
+        right = QVBoxLayout(right_panel)
+        right.setContentsMargins(0, 0, 0, 0)
         right.setSpacing(6)
+        self.right_scroll = QScrollArea()
+        self.right_scroll.setObjectName("rightScroll")
+        self.right_scroll.setWidget(right_panel)
+        self.right_scroll.setWidgetResizable(True)
+        self.right_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.right_scroll.setStyleSheet("#rightScroll, #rightPanel { background: transparent; }")
+        self.right_scroll.viewport().setAutoFillBackground(False)
+        self._right_panel = right_panel
+        self.right_scroll.viewport().installEventFilter(self)    # re-arrange when the column resizes
         outer.addLayout(left_col, 0)
-        outer.addLayout(right, 1)
+        outer.addWidget(self.right_scroll, 1)
 
         # 1 camera
         box = QGroupBox("1  Camera")
@@ -1073,6 +1103,7 @@ class MainWindow(QMainWindow):
 
         # preview
         box = QGroupBox("Camera preview")
+        self.preview_box = box
         v = QVBoxLayout(box)
         self.view = VideoView()
         v.addWidget(self.view, 1)
@@ -1138,12 +1169,18 @@ class MainWindow(QMainWindow):
         v.addWidget(self.pupil_plot)
         self.pupil_state = QLabel()
         self.pupil_state.setTextFormat(Qt.TextFormat.RichText)
+        self.pupil_state.setWordWrap(True)         # narrow when the panels sit side by side
         self.pupil_state.setToolTip("Eye movement from the pupil centre's speed over the last 0.2 s (moving above "
                                     "20 px/s); pupil from its diameter trend over the last 1 s (dilating or "
                                     "constricting beyond 8 % per second). Saved per frame in frames.csv.")
         v.addWidget(self.pupil_state)
         self.pupil_box.setVisible(False)
-        right.addWidget(self.pupil_box, 0)
+        # Pupil and signals sit under the preview; on a short screen they go side by side
+        # (see _arrange_right) so the preview keeps its height and nothing has to scroll.
+        self.bottom_row = QBoxLayout(QBoxLayout.Direction.TopToBottom)
+        self.bottom_row.setSpacing(6)
+        right.addLayout(self.bottom_row, 0)
+        self.bottom_row.addWidget(self.pupil_box, 1)
 
         # signals
         box = QGroupBox("Arduino signals")
@@ -1172,10 +1209,12 @@ class MainWindow(QMainWindow):
         wheel = QLabel("Wheel: zoom  ·  Shift+wheel: mic")
         wheel.setStyleSheet("color: #8a93ad;")
         row.addWidget(wheel)
+        self.wheel_hint = wheel
         v.addLayout(row)
         self.sig_label = hint("")
         v.addWidget(self.sig_label)
-        right.addWidget(box, 0)
+        self.signals_box = box
+        self.bottom_row.addWidget(box, 1)
 
         self.statusBar().addWidget(hint("Frame times, Arduino samples and TTL edges are all saved on the "
                                         "computer clock, so the video lines up with the Neuropixels TTL."), 1)
@@ -1541,6 +1580,43 @@ class MainWindow(QMainWindow):
                 cam.pupil_kin = None
         self._pupil_view_changed()
 
+    # ---- layout on short screens ---------------------------------------------
+    SIDE_BY_SIDE_SPARE = 150       # px of preview height wanted above its minimum before stacking
+    SIDE_BY_SIDE_PLOT_MAX = 150    # plot height cap side by side: the rest goes to the preview
+
+    def _arrange_right(self) -> None:
+        """Stack the pupil and signal panels under the preview when there is room, else put them
+        side by side (small laptops, Windows scaling at 125-150 %)."""
+        if not hasattr(self, "bottom_row"):
+            return
+        horizontal = False
+        if self.pupil_box.isVisibleTo(self):
+            sp = self.bottom_row.spacing()
+            stacked = (self.preview_box.minimumSizeHint().height() + self.pupil_box.minimumSizeHint().height()
+                       + self.signals_box.minimumSizeHint().height() + 2 * sp)
+            horizontal = self.right_scroll.viewport().height() < stacked + self.SIDE_BY_SIDE_SPARE
+            # only if both panels still fit next to each other (the wheel hint is hidden then)
+            side_w = (self.pupil_box.minimumSizeHint().width() + self.signals_box.minimumSizeHint().width()
+                      - (self.wheel_hint.minimumSizeHint().width() if self.wheel_hint.isVisibleTo(self) else 0)
+                      + self.bottom_row.spacing() + 10)
+            horizontal = horizontal and self.right_scroll.viewport().width() >= side_w
+        want = QBoxLayout.Direction.LeftToRight if horizontal else QBoxLayout.Direction.TopToBottom
+        if self.bottom_row.direction() != want:
+            self.bottom_row.setDirection(want)
+            self.wheel_hint.setVisible(not horizontal)
+            cap = self.SIDE_BY_SIDE_PLOT_MAX if horizontal else 16777215
+            self.pupil_plot.setMaximumHeight(cap)
+            self.scope.setMaximumHeight(cap)
+
+    def resizeEvent(self, ev) -> None:
+        super().resizeEvent(ev)
+        QTimer.singleShot(0, self._arrange_right)
+
+    def eventFilter(self, obj, ev) -> bool:
+        if ev.type() == QEvent.Type.Resize and obj is self.right_scroll.viewport():
+            QTimer.singleShot(0, self._arrange_right)
+        return super().eventFilter(obj, ev)
+
     def _pupil_toggled(self, *_a) -> None:
         self._apply_pupil()
 
@@ -1549,6 +1625,7 @@ class MainWindow(QMainWindow):
         show = self.pupil_show_chk.isChecked()
         self.view.show_pupil = show
         self.pupil_box.setVisible(on and show)
+        self._arrange_right()
         self.pupil_sens.setEnabled(on)
         self.pupil_show_chk.setEnabled(on)
         self.view.update()
